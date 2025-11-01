@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+python-dotenv
+openai>=1.0.0
+duckduckgo_search

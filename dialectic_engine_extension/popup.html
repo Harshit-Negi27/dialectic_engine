@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dialectic Engine</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f9f9fb;
+      color: #222;
+      width: 350px;
+      padding: 10px;
+    }
+    h1 {
+      font-size: 18px;
+      text-align: center;
+      color: #333;
+    }
+    #output {
+      margin-top: 10px;
+    }
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      padding: 10px;
+      margin: 8px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .summary {
+      border-left: 4px solid #007bff;
+    }
+    .claim {
+      border-left: 4px solid #ff9800;
+    }
+    .counterpoint {
+      border-left: 4px solid #4caf50;
+      margin-top: 5px;
+      padding-left: 8px;
+      font-style: italic;
+    }
+    button {
+      width: 100%;
+      padding: 8px;
+      background-color: #007bff;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    #loading {
+      display: none;
+      text-align: center;
+      color: #888;
+      font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <h1>🧠 Dialectic Engine</h1>
+  <button id="analyze">Analyze Page</button>
+  <div id="loading">Analyzing, please wait...</div>
+  <div id="output"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

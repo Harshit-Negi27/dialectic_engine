@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+*.log
+.DS_Store
+.vscode/
+__MACOSX/
+*.pkl
+*.sqlite3
+node_modules/
+venv/
+uploads/
+models/

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Dialectic Engine",
+  "version": "1.0",
+  "description": "Analyze and challenge online claims instantly.",
+  "permissions": ["activeTab", "scripting"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+  {
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "css": ["sidebar.css"]
+  }
+]
+
+}
