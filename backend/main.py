@@ -9,15 +9,21 @@ import asyncio
 from dotenv import load_dotenv
 from pathlib import Path
 
+# IMPORT THE DATABASE FUNCTIONS
+from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
+
 # --- 1. Setup & Configuration ---
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
+
+# Initialize the Database on startup
+init_db()
 
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 if not client.api_key:
-    print("ERROR: OPENAI_API_KEY not found. Check your backend/.env file.")
+    print("ERROR: OPENAI_API_KEY not found.")
     exit(1)
 
 app = FastAPI()
@@ -40,7 +46,7 @@ class AnalysisResponse(BaseModel):
     summary: str
     claims: list[Claim]
 
-# --- 3. Agents ---
+# --- 3. Agents (Keep these exactly the same as before) ---
 
 async def agent_summarize(text: str, client) -> str:
     print("--- Running Summarizer Agent ---")
@@ -84,46 +90,32 @@ async def agent_extract_claims(text: str, client) -> list[str]:
         print(f"Claim Extractor Error: {e}")
         return []
 
-# --- AGENT 3 & 4: RAG & Counterpoint (Speed Optimized) ---
 async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
-    # No more 'delay' parameter! Tavily handles concurrency well.
     print(f"--- RAG AGENT: Processing '{claim[:30]}...' ---")
-
-    # Step 1: Search with Tavily
     search_context = "No relevant search results found."
     
     try:
-        # We run Tavily in a thread to keep the event loop unblocked
         response = await asyncio.to_thread(
             tavily_client.search,
             query=claim,
-            search_depth="basic",
+            search_depth="advanced", 
             max_results=3,
         )
-        
-        # Extract the content
         results = response.get('results', [])
         if results:
             context_list = [f"[Source: {r['url']}]\nContent: {r['content']}" for r in results]
             search_context = "\n\n".join(context_list)
-        
     except Exception as e:
         print(f"    -> Tavily Search Error: {e}")
 
-    # Step 2: Generate Analysis
     prompt = f"""
     You are a generic critical analysis assistant.
-    
     Claim: "{claim}"
-    
     Verified Facts & Context:
     {search_context}
-    
     Tasks:
-    1.  **Counterpoint**: Write a balanced, one-paragraph counterpoint based on the Verified Facts.
-    2.  **Sources**: List 1-2 source URLs *only from the text provided above*.
-    3. Don't use while or While at the beginning of every counterpoint, keep changing the way of initiating the counterpoint so it does not look repetitive and boring.
-    
+    1. **Counterpoint**: Write a balanced, one-paragraph counterpoint based on Verified Facts.
+    2. **Sources**: List 1-2 source URLs *only from the text provided above*.
     Return ONLY valid JSON:
     {{"counterpoint": "...", "sources": ["https://..."]}}
     """
@@ -148,37 +140,41 @@ async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
         return Claim(claim=claim, counterpoint="Analysis failed.", sources=[])
 
 
-# --- 4. Coordinator Endpoint (Double Parallelism) ---
+# --- 4. Coordinator Endpoint (With Caching Logic) ---
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: Request):
     data = await req.json()
     text = data.get("text", "")
+    if len(text) > 20000: text = text[:20000]
 
-    if len(text) > 20000: 
-        text = text[:20000]
+    # 1. CHECK CACHE FIRST
+    # We run the DB check in a thread so it doesn't block the async loop
+    cached_result = await asyncio.to_thread(get_cached_analysis, text)
+    if cached_result:
+        # If found, return immediately! 0 API cost.
+        return AnalysisResponse(**cached_result)
 
-    # --- SPEED UP 1: Run Summary & Claim Extraction TOGETHER ---
-    print("--- Starting Phase 1: Summary & Extraction (Parallel) ---")
-    summary_task = agent_summarize(text, client)
-    claims_task = agent_extract_claims(text, client)
-    
-    # Wait for both to finish simultaneously
-    summary, claims_list = await asyncio.gather(summary_task, claims_task)
+    # 2. IF NOT IN CACHE, RUN AGENTS (The expensive part)
+    print("--- Phase 1: Summary & Claims ---")
+    summary, claims_list = await asyncio.gather(
+        agent_summarize(text, client),
+        agent_extract_claims(text, client)
+    )
 
-    processed_claims = []
     if not claims_list:
         return AnalysisResponse(summary=summary, claims=[])
 
-    # --- SPEED UP 2: Run All RAG Agents TOGETHER (No Delay) ---
-    print(f"--- Starting Phase 2: {len(claims_list)} RAG Agents (Parallel) ---")
-    tasks = []
-    for claim_text in claims_list:
-        if claim_text:
-            # We removed the 'delay' argument
-            tasks.append(agent_rag_and_counterpoint(claim_text, client))
-    
+    print(f"--- Phase 2: {len(claims_list)} RAG Agents ---")
+    tasks = [agent_rag_and_counterpoint(c, client) for c in claims_list if c]
     results = await asyncio.gather(*tasks)
     processed_claims = [res for res in results if res]
 
-    print("--- Analysis Complete ---")
-    return AnalysisResponse(summary=summary, claims=processed_claims)
+    # Create the final object
+    final_response = AnalysisResponse(summary=summary, claims=processed_claims)
+
+    # 3. SAVE TO CACHE
+    # Convert Pydantic model to dict for saving
+    await asyncio.to_thread(save_analysis_to_cache, text, final_response.model_dump())
+
+    print("--- Analysis Complete & Saved to Cache ---")
+    return final_response
