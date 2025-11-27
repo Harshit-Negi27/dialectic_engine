@@ -8,15 +8,16 @@ import json
 import asyncio
 from dotenv import load_dotenv
 from pathlib import Path
+from backend.youtube_utils import get_transcript_text
 
-# IMPORT THE DATABASE FUNCTIONS
+# Import the Database functions
 from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
 
-# --- 1. Setup & Configuration ---
+# Setup & configuration-
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# Initialize the Database on startup
+# Initialize the Database
 init_db()
 
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -36,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 2. Data Models ---
+# Data Models
 class Claim(BaseModel):
     claim: str
     counterpoint: str
@@ -46,10 +47,8 @@ class AnalysisResponse(BaseModel):
     summary: str
     claims: list[Claim]
 
-# --- 3. Agents (Keep these exactly the same as before) ---
-
 async def agent_summarize(text: str, client) -> str:
-    print("--- Running Summarizer Agent ---")
+    print("Running Summarizer Agent")
     try:
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
@@ -65,7 +64,7 @@ async def agent_summarize(text: str, client) -> str:
         return "Summary could not be generated."
 
 async def agent_extract_claims(text: str, client) -> list[str]:
-    print("--- Running Claim Extractor Agent ---")
+    print(" Running Claim Extractor Agent ")
     prompt = f"""
     Extract the top 3-5 distinct, factual, or argumentative claims from the article.
     Return ONLY a valid JSON list of strings.
@@ -91,7 +90,7 @@ async def agent_extract_claims(text: str, client) -> list[str]:
         return []
 
 async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
-    print(f"--- RAG AGENT: Processing '{claim[:30]}...' ---")
+    print(f" RAG AGENT: Processing '{claim[:30]}...' ")
     search_context = "No relevant search results found."
     
     try:
@@ -140,22 +139,32 @@ async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
         return Claim(claim=claim, counterpoint="Analysis failed.", sources=[])
 
 
-# --- 4. Coordinator Endpoint (With Caching Logic) ---
+# Coordinator Endpoint
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze(req: Request):
     data = await req.json()
     text = data.get("text", "")
+
+    # If the text looks like a YouTube URL, it will fetch the transcript
+    if "youtube.com" in text or "youtu.be" in text:
+        print(f" YouTube URL detected: {text}")
+        transcript = await asyncio.to_thread(get_transcript_text, text)
+        if transcript:
+            print("Transcript fetched successfully!")
+            text = transcript # Swap the URL for the full video text
+        else:
+            print("Could not fetch transcript. Analyzing raw URL (might fail).")
+
+
     if len(text) > 20000: text = text[:20000]
 
-    # 1. CHECK CACHE FIRST
-    # We run the DB check in a thread so it doesn't block the async loop
+    # Check the cache first, in a thread so it doesn't block the async loop
     cached_result = await asyncio.to_thread(get_cached_analysis, text)
     if cached_result:
-        # If found, return immediately! 0 API cost.
         return AnalysisResponse(**cached_result)
 
-    # 2. IF NOT IN CACHE, RUN AGENTS (The expensive part)
-    print("--- Phase 1: Summary & Claims ---")
+    # 2. If not in the cache, run agents 
+    print("Summary & Claims")
     summary, claims_list = await asyncio.gather(
         agent_summarize(text, client),
         agent_extract_claims(text, client)
@@ -172,9 +181,8 @@ async def analyze(req: Request):
     # Create the final object
     final_response = AnalysisResponse(summary=summary, claims=processed_claims)
 
-    # 3. SAVE TO CACHE
-    # Convert Pydantic model to dict for saving
+    # Save to cache & coonvert pydantic model to dict for saving
     await asyncio.to_thread(save_analysis_to_cache, text, final_response.model_dump())
 
-    print("--- Analysis Complete & Saved to Cache ---")
+    print(" Analysis Complete & Saved to Cache")
     return final_response
