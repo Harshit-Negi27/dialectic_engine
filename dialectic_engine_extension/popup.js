@@ -7,24 +7,29 @@ document.getElementById("analyze").addEventListener("click", async () => {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     
-    // --- PHASE 2 UPDATE: Check for YouTube ---
     let payloadText = "";
     
-    // Check if the current URL is a YouTube video
-    if (tab.url.includes("youtube.com/watch") || tab.url.includes("youtu.be")) {
-      console.log("🎥 YouTube Detected. Sending URL...");
-      // If it's YouTube, we send the URL itself, not the page text
+    // --- UPDATED LOGIC: Check for Standard Video AND Shorts ---
+    if (tab.url.includes("youtube.com/watch") || 
+        tab.url.includes("youtu.be") || 
+        tab.url.includes("youtube.com/shorts")) {
+      
+      console.log("🎥 YouTube Video/Short Detected. Sending URL...");
+      // For YouTube, we send the URL itself so the backend can fetch the transcript
       payloadText = tab.url;
+      
     } else {
-      // Otherwise, we extract the page text as usual
+      // For Articles, we scrape the visible text
+      console.log("📄 Article Detected. Scraping text...");
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => document.body.innerText,
       });
-      payloadText = result.slice(0, 20000); // Limit text size
+      // Limit text size to avoid huge payloads
+      payloadText = result.slice(0, 20000); 
     }
-    // ----------------------------------------
 
+    // Call the Backend
     const response = await fetch("http://127.0.0.1:8000/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -34,12 +39,18 @@ document.getElementById("analyze").addEventListener("click", async () => {
     const data = await response.json();
     loading.style.display = "none";
 
+    // --- RENDER RESULTS ---
+    
+    // 1. Summary
     if (data.summary) {
       output.innerHTML += `<div class='card summary'><strong>Summary:</strong><br>${data.summary}</div>`;
     }
 
+    // 2. Claims & Counterpoints
     if (data.claims && data.claims.length > 0) {
       data.claims.forEach((c, i) => {
+        
+        // Build Sources HTML
         let sourcesHTML = "";
         if (c.sources && c.sources.length > 0) {
           const sourceLinks = c.sources.map(sourceUrl => 
@@ -50,6 +61,7 @@ document.getElementById("analyze").addEventListener("click", async () => {
           sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
         }
         
+        // Add Card to UI
         output.innerHTML += `
           <div class='card claim'>
             <strong>Claim ${i + 1}:</strong> ${c.claim}

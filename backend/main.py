@@ -51,7 +51,7 @@ async def agent_summarize(text: str, client) -> str:
     print("Running Summarizer Agent")
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.1,
             messages=[
                 {"role": "system", "content": "You are a neutral, academic summarization assistant."},
@@ -73,7 +73,7 @@ async def agent_extract_claims(text: str, client) -> list[str]:
     """
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
@@ -120,7 +120,7 @@ async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
     """
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.4,
             response_format={"type": "json_object"},
             messages=[
