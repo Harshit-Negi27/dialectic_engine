@@ -64,20 +64,31 @@ async def agent_summarize(text: str, client) -> str:
         return "Summary could not be generated."
 
 async def agent_extract_claims(text: str, client) -> list[str]:
-    print(" Running Claim Extractor Agent ")
+    print("--- Running Claim Extractor Agent (Smart Mode) ---")
+    
     prompt = f"""
-    Extract the top 3-5 distinct, factual, or argumentative claims from the article.
+    Analyze the text and extract **up to 5** distinct, argumentative claims.
+    
+    CRITICAL INSTRUCTIONS FOR WHAT IS A "CLAIM":
+     **INCLUDE**: Opinions, predictions, cause-and-effect arguments, or controversial statements (e.g., "The economy is crashing because of X", "AI will replace doctors").
+     **IGNORE**: Definitions, rules of games, simple facts, personal anecdotes, or widely accepted knowledge (e.g., "A six is when the ball crosses the boundary", "The sky is blue").
+
+    If the text only has 1 valid argumentative claim, return ONLY 1. Do NOT force 5.
+    If there are ZERO argumentative claims (e.g., a tutorial or factual explanation), return an empty list [].
+
     Return ONLY a valid JSON list of strings.
-    Example: ["The sky is blue.", "Water boils at 100°C."]
-    Article: {text}
+    Example output: ["AI will eventually become conscious.", "The stock market is rigged against retail investors."]
+    
+    Article/Transcript:
+    {text[:15000]} 
     """
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.0,
+            model="gpt-4o-mini",
+            temperature=0.2, # Lower temp to force it to follow rules
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "You are a claim extraction robot. You only respond with a JSON list of strings."},
+                {"role": "system", "content": "You are a strict logic filter. You only extract debatable arguments, never definitions or facts."},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -88,7 +99,7 @@ async def agent_extract_claims(text: str, client) -> list[str]:
     except Exception as e:
         print(f"Claim Extractor Error: {e}")
         return []
-
+    
 async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
     print(f" RAG AGENT: Processing '{claim[:30]}...' ")
     search_context = "No relevant search results found."
