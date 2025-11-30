@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from tavily import TavilyClient
 from openai import AsyncOpenAI
@@ -8,24 +9,16 @@ import json
 import asyncio
 from dotenv import load_dotenv
 from pathlib import Path
+
+from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
 from backend.youtube_utils import get_transcript_text
 
-# Import the Database functions
-from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
-
-# Setup & configuration-
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
-
-# Initialize the Database
 init_db()
 
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-
-if not client.api_key:
-    print("ERROR: OPENAI_API_KEY not found.")
-    exit(1)
 
 app = FastAPI()
 
@@ -37,163 +30,137 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Data Models
-class Claim(BaseModel):
-    claim: str
-    counterpoint: str
-    sources: list[str]
+#  Agents
 
-class AnalysisResponse(BaseModel):
-    summary: str
-    claims: list[Claim]
-
-async def agent_summarize(text: str, client) -> str:
-    print("Running Summarizer Agent")
+async def agent_summarize(text: str) -> str:
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             temperature=0.1,
             messages=[
-                {"role": "system", "content": "You are a neutral, academic summarization assistant."},
-                {"role": "user", "content": f"Provide a concise, 2-3 sentence neutral summary of this article:\n\n{text}"}
+                {"role": "system", "content": "You are a neutral summarization assistant."},
+                {"role": "user", "content": f"Provide a concise, 2-3 sentence summary:\n\n{text[:15000]}"}
             ]
         )
         return resp.choices[0].message.content
-    except Exception as e:
-        print(f"Summarizer Error: {e}")
-        return "Summary could not be generated."
+    except: return "Summary unavailable."
 
-async def agent_extract_claims(text: str, client) -> list[str]:
-    print("--- Running Claim Extractor Agent (Smart Mode) ---")
-    
+async def agent_extract_claims(text: str) -> list:
     prompt = f"""
-    Analyze the text and extract **up to 5** distinct, argumentative claims.
-    
-    CRITICAL INSTRUCTIONS FOR WHAT IS A "CLAIM":
-     **INCLUDE**: Opinions, predictions, cause-and-effect arguments, or controversial statements (e.g., "The economy is crashing because of X", "AI will replace doctors").
-     **IGNORE**: Definitions, rules of games, simple facts, personal anecdotes, or widely accepted knowledge (e.g., "A six is when the ball crosses the boundary", "The sky is blue").
-
-    If the text only has 1 valid argumentative claim, return ONLY 1. Do NOT force 5.
-    If there are ZERO argumentative claims (e.g., a tutorial or factual explanation), return an empty list [].
-
+    Extract up to 5 distinct, argumentative claims. 
+    Ignore definitions, rules, or facts.
     Return ONLY a valid JSON list of strings.
-    Example output: ["AI will eventually become conscious.", "The stock market is rigged against retail investors."]
-    
-    Article/Transcript:
-    {text[:15000]} 
+    Text: {text[:15000]}
     """
     try:
         resp = await client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.2, # Lower temp to force it to follow rules
+            temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": "You are a strict logic filter. You only extract debatable arguments, never definitions or facts."},
+                {"role": "system", "content": "You are a logic filter. Respond with JSON."},
                 {"role": "user", "content": prompt}
             ]
         )
-        claims_list = json.loads(resp.choices[0].message.content)
-        if isinstance(claims_list, dict):
-            return claims_list.get("claims", []) 
-        return claims_list
-    except Exception as e:
-        print(f"Claim Extractor Error: {e}")
-        return []
-    
-async def agent_rag_and_counterpoint(claim: str, client) -> Claim:
-    print(f" RAG AGENT: Processing '{claim[:30]}...' ")
-    search_context = "No relevant search results found."
-    
+        data = json.loads(resp.choices[0].message.content)
+        return data.get("claims", [])
+    except: return []
+
+async def agent_rag_and_counterpoint(claim: str) -> dict:
+    search_context = "No results found."
     try:
         response = await asyncio.to_thread(
-            tavily_client.search,
-            query=claim,
-            search_depth="advanced", 
-            max_results=3,
+            tavily_client.search, query=claim, search_depth="advanced", max_results=2
         )
         results = response.get('results', [])
         if results:
             context_list = [f"[Source: {r['url']}]\nContent: {r['content']}" for r in results]
             search_context = "\n\n".join(context_list)
-    except Exception as e:
-        print(f"    -> Tavily Search Error: {e}")
+    except: pass
 
     prompt = f"""
-    You are a generic critical analysis assistant.
     Claim: "{claim}"
-    Verified Facts & Context:
-    {search_context}
-    Tasks:
-    1. **Counterpoint**: Write a balanced, one-paragraph counterpoint based on Verified Facts.
-    2. **Sources**: List 1-2 source URLs *only from the text provided above*.
-    Return ONLY valid JSON:
-    {{"counterpoint": "...", "sources": ["https://..."]}}
+    Facts: {search_context}
+    1. Write a balanced counterpoint.
+    2. List 1-2 source URLs from the text.
+    Return JSON: {{"counterpoint": "...", "sources": ["..."]}}
     """
     try:
         resp = await client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.4,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You are a critical thinker. You only respond with JSON."},
-                {"role": "user", "content": prompt}
-            ]
+            model="gpt-4o-mini", temperature=0.4, response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": "JSON only."}, {"role": "user", "content": prompt}]
         )
-        data = json.loads(resp.choices[0].message.content)
-        return Claim(
-            claim=claim,
-            counterpoint=data.get("counterpoint", "No counterpoint generated."),
-            sources=data.get("sources", [])
-        )
-    except Exception as e:
-        print(f"RAG Agent Error: {e}")
-        return Claim(claim=claim, counterpoint="Analysis failed.", sources=[])
+        return json.loads(resp.choices[0].message.content)
+    except: return {"counterpoint": "Analysis failed.", "sources": []}
+
+#  The Generator (Streaming Logic) 
+async def analysis_generator(text: str):
+    """Yields chunks of data as they become available."""
+    
+    # Check cache
+    cached = await asyncio.to_thread(get_cached_analysis, text)
+    if cached:
+        yield json.dumps({"status": "complete", "data": cached}) + "\n"
+        return
+
+    #  Summary
+    yield json.dumps({"status": "progress", "message": " Generating Summary..."}) + "\n"
+    summary = await agent_summarize(text)
+    # Send Summary IMMEDIATELY so user can read it
+    yield json.dumps({"status": "partial_summary", "summary": summary}) + "\n"
+
+    # Claims
+    yield json.dumps({"status": "progress", "message": " Extracting Claims..."}) + "\n"
+    claims = await agent_extract_claims(text)
+    
+    if not claims:
+        yield json.dumps({"status": "error", "message": "No claims found."}) + "\n"
+        return
+
+    # RAG
+    yield json.dumps({"status": "progress", "message": f" Verifying {len(claims)} Claims..."}) + "\n"
+    
+    full_claims_data = []
+    
+    
+    tasks = [agent_rag_and_counterpoint(c) for c in claims]
+    
+    
+    
+    rag_results = await asyncio.gather(*tasks)
+    
+    for i, res in enumerate(rag_results):
+        claim_obj = {
+            "claim": claims[i],
+            "counterpoint": res.get("counterpoint"),
+            "sources": res.get("sources")
+        }
+        full_claims_data.append(claim_obj)
+
+    # Final payload
+    final_data = {"summary": summary, "claims": full_claims_data}
+    
+    # Save to Ccche
+    await asyncio.to_thread(save_analysis_to_cache, text, final_data)
+    
+    yield json.dumps({"status": "complete", "data": final_data}) + "\n"
 
 
-# Coordinator Endpoint
-@app.post("/analyze", response_model=AnalysisResponse)
+# Endpoint
+@app.post("/analyze")
 async def analyze(req: Request):
     data = await req.json()
-    text = data.get("text", "")
-
-    # If the text looks like a YouTube URL, it will fetch the transcript
-    if "youtube.com" in text or "youtu.be" in text:
-        print(f" YouTube URL detected: {text}")
-        transcript = await asyncio.to_thread(get_transcript_text, text)
+    raw_text = data.get("text", "")
+    
+    # Handle YouTube
+    if "youtube.com" in raw_text or "youtu.be" in raw_text:
+        transcript = await asyncio.to_thread(get_transcript_text, raw_text)
         if transcript:
-            print("Transcript fetched successfully!")
-            text = transcript # Swap the URL for the full video text
+            raw_text = transcript
         else:
-            print("Could not fetch transcript. Analyzing raw URL (might fail).")
+            return StreamingResponse(
+                iter([json.dumps({"status": "error", "message": "No transcript found."}) + "\n"]),
+                media_type="application/x-ndjson"
+            )
 
-
-    if len(text) > 20000: text = text[:20000]
-
-    # Check the cache first, in a thread so it doesn't block the async loop
-    cached_result = await asyncio.to_thread(get_cached_analysis, text)
-    if cached_result:
-        return AnalysisResponse(**cached_result)
-
-    # 2. If not in the cache, run agents 
-    print("Summary & Claims")
-    summary, claims_list = await asyncio.gather(
-        agent_summarize(text, client),
-        agent_extract_claims(text, client)
-    )
-
-    if not claims_list:
-        return AnalysisResponse(summary=summary, claims=[])
-
-    print(f"--- Phase 2: {len(claims_list)} RAG Agents ---")
-    tasks = [agent_rag_and_counterpoint(c, client) for c in claims_list if c]
-    results = await asyncio.gather(*tasks)
-    processed_claims = [res for res in results if res]
-
-    # Create the final object
-    final_response = AnalysisResponse(summary=summary, claims=processed_claims)
-
-    # Save to cache & coonvert pydantic model to dict for saving
-    await asyncio.to_thread(save_analysis_to_cache, text, final_response.model_dump())
-
-    print(" Analysis Complete & Saved to Cache")
-    return final_response
+    return StreamingResponse(analysis_generator(raw_text), media_type="application/x-ndjson")
