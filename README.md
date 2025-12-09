@@ -8,7 +8,8 @@
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)](LICENSE)
 
 ## 🎥 Demo
-**[Watch the 60-Second Demo Video Here]** *(Add your Loom/YouTube link here)*
+<video src="https://github.com/user-attachments/assets/6deac345-ce4d-4ae3-a54b-8863cce51f46" controls="controls" style="max-width: 100%;">
+</video>
 
 ![Dialectic Engine Screenshot](https://via.placeholder.com/800x400?text=App+Screenshot+Placeholder)
 
@@ -53,3 +54,93 @@ graph TD
     Claims -->|For Each Claim| Verifier[Tavily Search Agent]
     
     Verifier -->|Stream JSON| User```
+
+# 🛠️ Tech Stack
+
+**Frontend:** Chrome Extension (Manifest V3), Vanilla JS, Server-Sent Events (SSE)  
+**Backend:** Python, FastAPI, Uvicorn  
+**AI & Search:** OpenAI (GPT-4o-mini), Tavily Search API  
+**Data:** SQLite (Local Caching)  
+**Deployment:** Render (Dockerized)
+
+---
+
+# ⚡ Installation (Local Dev)
+
+## 1. Clone the Repository
+
+```bash
+git clone https://github.com/yourusername/dialectic-engine.git
+cd dialectic-engine
+```
+
+## 2. Backend Setup
+
+```bash
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate      # On Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r backend/requirements.txt
+
+# Set up environment variables
+# Create a .env file in /backend with:
+# OPENAI_API_KEY=sk-...
+# TAVILY_API_KEY=tvly-...
+```
+
+## 3. Run the Server
+
+```bash
+uvicorn backend.main:app --reload
+```
+
+Server will start at:  
+👉 http://127.0.0.1:8000
+
+## 4. Load the Extension
+
+1. Open Chrome and go to: `chrome://extensions`
+2. Enable **Developer Mode** (top right)
+3. Click **Load unpacked**
+4. Select the `extension/` folder
+
+---
+
+# 🧩 Engineering Challenges Solved
+
+## 1. The "YouTube Block"
+
+YouTube aggressively blocks datacenter IPs (Render/AWS).  
+Solved by implementing a **client-side extraction fallback** using the user's browser + Piped API, bypassing IP blocks entirely.
+
+## 2. Concurrency
+
+Reduced latency from **20s → ~10s** by using:
+
+- `asyncio.gather`
+- Streaming responses  
+- Parallel summarization + claim extraction
+
+## 3. State Management
+
+YouTube often removes `ytInitialPlayerResponse` from the DOM.  
+Fixed using a **“Spy Script” DOM injection technique** to capture ephemeral variables before they disappear.
+
+---
+
+# 🔮 Future Roadmap
+
+- [ ] **Chat Mode:** Add follow-up chat interface using OpenAI Agents SDK  
+- [ ] **Audio Analysis:** Support for Instagram Reels/TikTok (Whisper)  
+- [ ] **User Accounts:** Sync history across devices  
+
+---
+
+# 🤝 Contributing
+
+Open to contributions!  
+Feel free to submit a Pull Request.
+
+Built by **Harshit Negi**.
