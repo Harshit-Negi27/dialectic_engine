@@ -52,4 +52,4 @@ graph TD
     
     Claims -->|For Each Claim| Verifier[Tavily Search Agent]
     
-    Verifier -->|Stream JSON| User
+    Verifier -->|Stream JSON| User```
