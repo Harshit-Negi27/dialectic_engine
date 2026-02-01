@@ -111,7 +111,10 @@ TAVILY_API_KEY=tvly-...
 ```bash
 uvicorn backend.main:app --reload
 ```
-👉 Server runs at: `http://127.0.0.1:8000`
+### 🌐 Server URLs
+
+- **Local Development:** http://127.0.0.1:8000  
+- **Production (Render):** https://dialectic-engine.onrender.com
 
 ### 4️⃣ Load the Chrome Extension
 1. Open `chrome://extensions`
