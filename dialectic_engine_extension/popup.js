@@ -52,17 +52,15 @@ document.getElementById("analyze").addEventListener("click", async () => {
 
     statusDiv.innerText = "Analyzing...";
     
-    const response = await fetch("https://dialectic-engine.onrender.com/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ text: payloadText }),
-    });
+    const response = await fetchBackendAnalysis(payloadText);
 
     loading.style.display = "none";
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let summaryRendered = false;
+    let claimsRenderedCount = 0;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -80,18 +78,31 @@ document.getElementById("analyze").addEventListener("click", async () => {
           if (msg.status === "progress") {
             statusDiv.innerText = msg.message;
           } else if (msg.status === "partial_summary") {
-            const sumDiv = document.createElement('div');
-            sumDiv.className = 'card summary';
-            sumDiv.innerHTML = `<strong>Summary:</strong><br>${msg.summary}`;
-            output.appendChild(sumDiv);
+            if (!summaryRendered) {
+              renderSummaryCard(msg.summary);
+              summaryRendered = true;
+            }
+          } else if (msg.status === "claim_ready") {
+            if (msg.progress) statusDiv.innerText = msg.progress;
+            renderSingleClaim(msg.claim);
+            claimsRenderedCount++;
           } else if (msg.status === "complete") {
-            statusDiv.innerText = "Analysis Complete";
-            renderClaims(msg.data.claims);
+            statusDiv.innerText = "Analysis Complete ✅";
+            // On cache hit or direct complete, render summary if missing
+            if (!summaryRendered && msg.data && msg.data.summary) {
+              renderSummaryCard(msg.data.summary);
+              summaryRendered = true;
+            }
+            // If no individual claims were streamed (e.g. cache hit), render them now
+            if (claimsRenderedCount === 0 && msg.data && msg.data.claims) {
+              renderClaims(msg.data.claims);
+              claimsRenderedCount = msg.data.claims.length;
+            }
           } else if (msg.status === "error") {
             statusDiv.innerHTML = `<span style="color:red">${msg.message}</span>`;
           }
         } catch (e) {
-          console.error(e);
+          console.error("Failed to parse stream chunk:", e);
         }
       }
     }
@@ -101,6 +112,63 @@ document.getElementById("analyze").addEventListener("click", async () => {
     statusDiv.innerHTML = `<div style="color:red;">Error: ${error.message}</div>`;
   }
 });
+
+async function fetchBackendAnalysis(text) {
+  // Try local backend first (if running during development), otherwise fallback to production Render
+  try {
+    const localRes = await fetch("http://127.0.0.1:8000/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ text }),
+    });
+    if (localRes.ok) return localRes;
+  } catch (e) {
+    // Local server not available, use production Render
+  }
+
+  return await fetch("https://dialectic-engine.onrender.com/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify({ text }),
+  });
+}
+
+function renderSummaryCard(summaryText) {
+  const output = document.getElementById("output");
+  const sumDiv = document.createElement("div");
+  sumDiv.className = "card summary";
+  sumDiv.innerHTML = `<strong>Summary:</strong><br>${summaryText}`;
+  output.appendChild(sumDiv);
+}
+
+function renderSingleClaim(c) {
+  const output = document.getElementById("output");
+  let sourcesHTML = "";
+  if (c.sources && c.sources.length > 0) {
+    const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
+    sourcesHTML = `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
+  } else {
+    sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
+  }
+  
+  const claimDiv = document.createElement("div");
+  claimDiv.className = "card claim";
+  claimDiv.innerHTML = `
+    <strong>Claim:</strong> ${c.claim}
+    <div class='counterpoint'>${c.counterpoint}</div>
+    ${sourcesHTML}
+  `;
+  output.appendChild(claimDiv);
+}
+
+function renderClaims(claims) {
+  const output = document.getElementById("output");
+  if (!claims || claims.length === 0) {
+    output.innerHTML += `<div>No claims found.</div>`;
+    return;
+  }
+  claims.forEach(renderSingleClaim);
+}
 
 function extractVideoId(url) {
   const urlObj = new URL(url);
@@ -130,30 +198,4 @@ async function fetchTranscriptFromPiped(videoId) {
   } catch (e) {
     return null;
   }
-}
-
-function renderClaims(claims) {
-  const output = document.getElementById("output");
-  if (!claims || claims.length === 0) {
-    output.innerHTML += `<div>No claims found.</div>`;
-    return;
-  }
-  
-  claims.forEach((c) => {
-    let sourcesHTML = "";
-    if (c.sources && c.sources.length > 0) {
-      const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank">${s}</a>`).join('<br>');
-      sourcesHTML = `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
-    } else {
-      sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
-    }
-    
-    output.innerHTML += `
-      <div class='card claim'>
-        <strong>Claim:</strong> ${c.claim}
-        <div class='counterpoint'>${c.counterpoint}</div>
-        ${sourcesHTML}
-      </div>
-    `;
-  });
 }

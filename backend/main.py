@@ -103,44 +103,54 @@ async def analysis_generator(text: str):
         yield json.dumps({"status": "complete", "data": cached}) + "\n"
         return
 
-    #  Summary
-    yield json.dumps({"status": "progress", "message": " Generating Summary..."}) + "\n"
-    summary = await agent_summarize(text)
-    # Send Summary IMMEDIATELY so user can read it
+    # Launch Summary and Claim Extraction concurrently
+    yield json.dumps({"status": "progress", "message": " Analyzing content & extracting claims..."}) + "\n"
+    summary_task = asyncio.create_task(agent_summarize(text))
+    claims_task = asyncio.create_task(agent_extract_claims(text))
+
+    # Await and stream summary as soon as it's ready
+    summary = await summary_task
     yield json.dumps({"status": "partial_summary", "summary": summary}) + "\n"
 
-    # Claims
-    yield json.dumps({"status": "progress", "message": " Extracting Claims..."}) + "\n"
-    claims = await agent_extract_claims(text)
+    # Await claims (already running in parallel)
+    claims = await claims_task
     
     if not claims:
         yield json.dumps({"status": "error", "message": "No claims found."}) + "\n"
         return
 
-    # RAG
-    yield json.dumps({"status": "progress", "message": f" Verifying {len(claims)} Claims..."}) + "\n"
+    total_claims = len(claims)
+    yield json.dumps({"status": "progress", "message": f" Verifying {total_claims} claims in parallel..."}) + "\n"
+
+    # Process each claim: research facts with Tavily and generate counterpoint with OpenAI
+    async def process_single_claim(claim_text: str):
+        res = await agent_rag_and_counterpoint(claim_text)
+        return {
+            "claim": claim_text,
+            "counterpoint": res.get("counterpoint", "Analysis failed."),
+            "sources": res.get("sources", [])
+        }
+
+    claim_tasks = [asyncio.create_task(process_single_claim(c)) for c in claims]
     
     full_claims_data = []
-    
-    
-    tasks = [agent_rag_and_counterpoint(c) for c in claims]
-    
-    
-    
-    rag_results = await asyncio.gather(*tasks)
-    
-    for i, res in enumerate(rag_results):
-        claim_obj = {
-            "claim": claims[i],
-            "counterpoint": res.get("counterpoint"),
-            "sources": res.get("sources")
-        }
+    completed_count = 0
+
+    # Stream each claim to the frontend the instant it is ready!
+    for coro in asyncio.as_completed(claim_tasks):
+        claim_obj = await coro
         full_claims_data.append(claim_obj)
+        completed_count += 1
+        yield json.dumps({
+            "status": "claim_ready",
+            "claim": claim_obj,
+            "progress": f"Verified {completed_count}/{total_claims} claims"
+        }) + "\n"
 
     # Final payload
     final_data = {"summary": summary, "claims": full_claims_data}
     
-    # Save to Ccche
+    # Save to Cache
     await asyncio.to_thread(save_analysis_to_cache, text, final_data)
     
     yield json.dumps({"status": "complete", "data": final_data}) + "\n"
