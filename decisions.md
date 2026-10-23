@@ -35,3 +35,20 @@ Originally, the backend pipeline executed sequentially:
 ### Impact
 * Reduced initial time-to-first-claim from ~8–12s down to ~2–4s.
 * Zero perceived lag: user can read the first claim & counter-argument while the remaining claims are still being processed.
+
+---
+
+## Decision 2: Anti-Buffering Headers & Visual Latency Telemetry
+* **Date:** 2026-10-23
+* **Status:** Implemented
+
+### Context & Problem
+During testing, responses on reverse proxies (such as Render or Nginx) were being buffered, flushing all output chunks in a single batch after 20 seconds. In addition, developers had no visual indicator showing whether the extension was communicating with the local development server or the cloud fallback, nor when each event fired.
+
+### Changes Made
+1. **Streaming HTTP Headers (`backend/main.py`):**
+   - Added `X-Accel-Buffering: no` and `Cache-Control: no-cache` to FastAPI's `StreamingResponse`.
+   - Instructs intermediate reverse proxies to flush NDJSON chunks immediately without holding them in 4KB/8KB buffers.
+2. **Real-time Telemetry & DevTools Logging (`popup.js`):**
+   - Display active backend source badge (`[Local: 127.0.0.1:8000]` vs `[Cloud: Render]`).
+   - Added stopwatch badges on cards (`⏱️ 1.8s`, `⏱️ 3.4s`) and timestamped `console.log` logs for each received chunk.

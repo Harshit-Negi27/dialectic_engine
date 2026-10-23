@@ -173,4 +173,12 @@ async def analyze(req: Request):
                 media_type="application/x-ndjson"
             )
 
-    return StreamingResponse(analysis_generator(raw_text), media_type="application/x-ndjson")
+    return StreamingResponse(
+        analysis_generator(raw_text),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+    )

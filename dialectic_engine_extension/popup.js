@@ -50,9 +50,12 @@ document.getElementById("analyze").addEventListener("click", async () => {
       payloadText = result.slice(0, 20000);
     }
 
-    statusDiv.innerText = "Analyzing...";
+    const connectStart = Date.now();
+    statusDiv.innerHTML = "Connecting to backend...";
     
-    const response = await fetchBackendAnalysis(payloadText);
+    const { response, target } = await fetchBackendAnalysis(payloadText);
+    const connectTime = ((Date.now() - connectStart) / 1000).toFixed(2);
+    console.log(`[Dialectic] Connected to ${target} in ${connectTime}s`);
 
     loading.style.display = "none";
 
@@ -61,6 +64,8 @@ document.getElementById("analyze").addEventListener("click", async () => {
     let buffer = "";
     let summaryRendered = false;
     let claimsRenderedCount = 0;
+    const streamStart = Date.now();
+    const getElapsed = () => ((Date.now() - streamStart) / 1000).toFixed(2) + "s";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -74,32 +79,34 @@ document.getElementById("analyze").addEventListener("click", async () => {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
+          const elapsed = getElapsed();
+          console.log(`[Dialectic @ ${elapsed}] Chunk received:`, msg);
           
           if (msg.status === "progress") {
-            statusDiv.innerText = msg.message;
+            statusDiv.innerHTML = `<span style="font-size: 11px; color: #666;">[${target} • ${elapsed}]</span><br>${msg.message}`;
           } else if (msg.status === "partial_summary") {
             if (!summaryRendered) {
-              renderSummaryCard(msg.summary);
+              renderSummaryCard(msg.summary, elapsed);
               summaryRendered = true;
             }
           } else if (msg.status === "claim_ready") {
-            if (msg.progress) statusDiv.innerText = msg.progress;
-            renderSingleClaim(msg.claim);
+            statusDiv.innerHTML = `<span style="font-size: 11px; color: #666;">[${target} • ${elapsed}]</span><br>${msg.progress || "Verifying claims..."}`;
+            renderSingleClaim(msg.claim, elapsed);
             claimsRenderedCount++;
           } else if (msg.status === "complete") {
-            statusDiv.innerText = "Analysis Complete ✅";
+            statusDiv.innerHTML = `<span style="font-size: 11px; color: #28a745; font-weight: bold;">[${target} • Finished in ${elapsed}]</span><br>Analysis Complete ✅`;
             // On cache hit or direct complete, render summary if missing
             if (!summaryRendered && msg.data && msg.data.summary) {
-              renderSummaryCard(msg.data.summary);
+              renderSummaryCard(msg.data.summary, elapsed);
               summaryRendered = true;
             }
-            // If no individual claims were streamed (e.g. cache hit), render them now
+            // If no individual claims were streamed (e.g. cache hit or older backend), render them now
             if (claimsRenderedCount === 0 && msg.data && msg.data.claims) {
-              renderClaims(msg.data.claims);
+              renderClaims(msg.data.claims, elapsed);
               claimsRenderedCount = msg.data.claims.length;
             }
           } else if (msg.status === "error") {
-            statusDiv.innerHTML = `<span style="color:red">${msg.message}</span>`;
+            statusDiv.innerHTML = `<span style="color:red">[${target}] Error: ${msg.message}</span>`;
           }
         } catch (e) {
           console.error("Failed to parse stream chunk:", e);
@@ -121,27 +128,31 @@ async function fetchBackendAnalysis(text) {
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify({ text }),
     });
-    if (localRes.ok) return localRes;
+    if (localRes.ok) {
+      return { response: localRes, target: "Local (127.0.0.1:8000)" };
+    }
   } catch (e) {
-    // Local server not available, use production Render
+    console.warn("[Dialectic] Local backend not reachable on :8000, falling back to Render...");
   }
 
-  return await fetch("https://dialectic-engine.onrender.com/analyze", {
+  const renderRes = await fetch("https://dialectic-engine.onrender.com/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify({ text }),
   });
+  return { response: renderRes, target: "Cloud (Render)" };
 }
 
-function renderSummaryCard(summaryText) {
+function renderSummaryCard(summaryText, elapsed) {
   const output = document.getElementById("output");
   const sumDiv = document.createElement("div");
   sumDiv.className = "card summary";
-  sumDiv.innerHTML = `<strong>Summary:</strong><br>${summaryText}`;
+  const badge = elapsed ? `<span style="float: right; font-size: 10px; color: #888; font-weight: normal;">⏱️ ${elapsed}</span>` : "";
+  sumDiv.innerHTML = `<strong>Summary:</strong>${badge}<br>${summaryText}`;
   output.appendChild(sumDiv);
 }
 
-function renderSingleClaim(c) {
+function renderSingleClaim(c, elapsed) {
   const output = document.getElementById("output");
   let sourcesHTML = "";
   if (c.sources && c.sources.length > 0) {
@@ -151,23 +162,24 @@ function renderSingleClaim(c) {
     sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
   }
   
+  const badge = elapsed ? `<span style="float: right; font-size: 10px; color: #888; font-weight: normal;">⏱️ ${elapsed}</span>` : "";
   const claimDiv = document.createElement("div");
   claimDiv.className = "card claim";
   claimDiv.innerHTML = `
-    <strong>Claim:</strong> ${c.claim}
+    <strong>Claim:</strong>${badge} ${c.claim}
     <div class='counterpoint'>${c.counterpoint}</div>
     ${sourcesHTML}
   `;
   output.appendChild(claimDiv);
 }
 
-function renderClaims(claims) {
+function renderClaims(claims, elapsed) {
   const output = document.getElementById("output");
   if (!claims || claims.length === 0) {
     output.innerHTML += `<div>No claims found.</div>`;
     return;
   }
-  claims.forEach(renderSingleClaim);
+  claims.forEach(c => renderSingleClaim(c, elapsed));
 }
 
 function extractVideoId(url) {
