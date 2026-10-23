@@ -52,3 +52,16 @@ During testing, responses on reverse proxies (such as Render or Nginx) were bein
 2. **Real-time Telemetry & DevTools Logging (`popup.js`):**
    - Display active backend source badge (`[Local: 127.0.0.1:8000]` vs `[Cloud: Render]`).
    - Added stopwatch badges on cards (`⏱️ 1.8s`, `⏱️ 3.4s`) and timestamped `console.log` logs for each received chunk.
+
+---
+
+## Decision 3: Dedicated Health Check Endpoints for Keep-Alive Pings
+* **Date:** 2026-10-23
+* **Status:** Implemented
+
+### Context & Problem
+Render's free tier spins down web services after 15 minutes of inactivity, causing ~50-second cold starts. Pinging `/` previously returned `404 Not Found`.
+
+### Changes Made
+- Added `@app.get("/health")` and `@app.get("/")` returning `{"status": "ok"}` in `backend/main.py`.
+- Enables external cron services (e.g., cron-job.org) to ping the server every 10–14 minutes with negligible CPU and zero token consumption.

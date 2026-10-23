@@ -156,7 +156,12 @@ async def analysis_generator(text: str):
     yield json.dumps({"status": "complete", "data": final_data}) + "\n"
 
 
-# Endpoint
+# Endpoints
+@app.get("/health")
+@app.get("/")
+async def health_check():
+    return {"status": "ok"}
+
 @app.post("/analyze")
 async def analyze(req: Request):
     data = await req.json()
