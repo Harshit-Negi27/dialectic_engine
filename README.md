@@ -114,7 +114,7 @@ uvicorn backend.main:app --reload
 ### 🌐 Server URLs
 
 - **Local Development:** http://127.0.0.1:8000  
-- **Production (Render):** https://dialectic-engine.onrender.com
+- **Production (Render):** https://dialectic-engine-pqdo.onrender.com
 
 ### 4️⃣ Load the Chrome Extension
 1. Open `chrome://extensions`

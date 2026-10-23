@@ -135,7 +135,7 @@ async function fetchBackendAnalysis(text) {
     console.warn("[Dialectic] Local backend not reachable on :8000, falling back to Render...");
   }
 
-  const renderRes = await fetch("https://dialectic-engine.onrender.com/analyze", {
+  const renderRes = await fetch("https://dialectic-engine-pqdo.onrender.com/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify({ text }),
