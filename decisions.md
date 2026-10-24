@@ -65,3 +65,76 @@ Render's free tier spins down web services after 15 minutes of inactivity, causi
 ### Changes Made
 - Added `@app.get("/health")` and `@app.get("/")` returning `{"status": "ok"}` in `backend/main.py`.
 - Enables external cron services (e.g., cron-job.org) to ping the server every 10–14 minutes with negligible CPU and zero token consumption.
+
+---
+
+## Decision 4: Prompt Quality Rewrite with A/B Testing (v1 vs v2)
+* **Date:** 2026-10-24
+* **Status:** Implemented
+
+### Context & Problem
+The original (v1) prompts had several quality issues:
+1. **Claim extraction was unfocused:** The prompt said "extract argumentative claims" but gave no criteria for what makes a claim debatable. The model often returned definitions, author framing ("this article explains..."), or common knowledge as "claims."
+2. **Tavily searched for confirmation, not counter-evidence:** The raw claim text was used as the Tavily search query, which naturally returned results that *supported* the claim rather than challenging it.
+3. **The model hallucinated URLs:** v1 told the model to "list 1-2 source URLs from the text" — but LLMs routinely mangle, truncate, or invent URLs. There was no validation.
+4. **Counterpoints were generic:** The system prompt was just `"JSON only."` with no grounding instructions. The model defaulted to vague hedging ("a balanced approach is needed", "it depends on context") instead of citing specific findings.
+5. **No error recovery:** If the model returned malformed JSON (which happens ~2-5% of the time with complex prompts), the entire agent silently returned an empty result.
+
+### Changes Made
+
+#### 1. `PROMPT_VERSION` env var for A/B testing
+- Added `PROMPT_VERSION` (reads from `.env`, defaults to `"v2"`).
+- All agent functions route through dispatcher functions: `agent_extract_claims()` → calls `_v1()` or `_v2()`, same for `agent_rag_and_counterpoint()`.
+- This lets us run the exact same article through both prompt versions and compare output quality side by side.
+
+#### 2. `agent_extract_claims_v2` — Stricter claim filtering + search queries
+- **System prompt:** `"You select claims worth challenging. Be strict: quality over quantity. Output JSON only."`
+- **User prompt changes:**
+  - Explicit 4-part qualification criteria (asserts something about the world, not a definition, someone could disagree, specific enough to search).
+  - Explicit skip list (definitions, common knowledge, generic advice, meta-commentary).
+  - Each claim is rewritten as a standalone sentence (no pronouns).
+  - Each claim gets a `search_query` (5-10 words) designed to find evidence *against* the claim.
+- **Output format changed:** From `{"claims": ["string"]}` to `{"claims": [{"claim": "...", "search_query": "..."}]}`.
+- **Why this matters:** The `search_query` is the single biggest quality lever. Instead of Tavily searching "AI agents can perform complex tasks" (which returns articles *about* AI agents), it now searches something like "limitations of AI agents vs traditional models" — which returns articles that actually challenge the claim.
+
+#### 3. `agent_rag_and_counterpoint_v2` — Grounded citations + stance detection
+- **Tavily search now uses `search_query`** instead of the raw claim text.
+- **Numbered source format:** Tavily results are formatted as `[1] URL: ... Content: ...` and `[2] URL: ...` so the model can cite by index.
+- **System prompt:** `"You are a rigorous research assistant. Use ONLY the sources provided. Never invent facts, numbers, or URLs. Output JSON only."`
+- **User prompt changes:**
+  - Explicit instruction to name findings, numbers, examples, or conditions from the sources.
+  - Explicit ban on generic reasoning unless backed by a source.
+  - Citation format: `[1]`, `[2]` inline.
+  - Word limit: 2-3 sentences, max 70 words.
+  - Stance field: `"contested"` / `"supported"` / `"insufficient"`.
+- **Citation index → URL mapping in code:** The model returns `"cited": [1, 2]`. Our code maps those indices back to real Tavily URLs, validates index ranges, and deduplicates. The model never produces a URL itself.
+- **Why this matters:** Eliminates URL hallucination entirely. The model can only reference sources we actually retrieved.
+
+#### 4. `_safe_llm_json` — Centralized error handling with retry
+- All LLM calls that expect JSON now go through `_safe_llm_json()`.
+- On `json.JSONDecodeError`, `KeyError`, or `IndexError`: retries once automatically.
+- On second failure or any other exception: returns `None`, and the caller provides a graceful fallback.
+
+#### 5. `analysis_generator` updated for v2 claim format
+- `process_single_claim` now handles both formats: v1 plain strings and v2 `{"claim": ..., "search_query": ...}` dicts.
+- The `stance` field is included in the streamed `claim_ready` JSON when present (v2), but omitted for v1 — so the Chrome extension doesn't break regardless of version.
+- Empty claims message is version-aware: v2 says "No strongly debatable claims found" (more honest), v1 says "No claims found."
+
+### Files & Functions Changed
+| File | Functions Changed |
+|------|------------------|
+| `backend/main.py` | Added: `_safe_llm_json`, `agent_extract_claims_v1`, `agent_extract_claims_v2`, `agent_rag_and_counterpoint_v1`, `agent_rag_and_counterpoint_v2`. Modified: `agent_extract_claims` (now dispatcher), `agent_rag_and_counterpoint` (now dispatcher), `process_single_claim`, `analysis_generator`, `health_check`. |
+| `backend/.env.example` | Added `PROMPT_VERSION=v2` |
+
+### How to A/B Test
+```bash
+# Run v2 (new prompts, default):
+PROMPT_VERSION=v2 uvicorn backend.main:app --reload
+
+# Run v1 (old prompts):
+PROMPT_VERSION=v1 uvicorn backend.main:app --reload
+
+# Check which version is active:
+curl http://127.0.0.1:8000/health
+# → {"status": "ok", "prompt_version": "v2"}
+```
