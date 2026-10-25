@@ -45,17 +45,72 @@ document.getElementById("analyze").addEventListener("click", async () => {
     } else {
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: () => document.body.innerText,
+        func: () => {
+          let pubDate = null;
+          // 1. meta article:published_time
+          const metaSelectors = [
+            'meta[property="article:published_time"]',
+            'meta[name="article:published_time"]',
+            'meta[name="publication_date"]',
+            'meta[name="pubdate"]',
+            'meta[name="date"]',
+            'meta[property="og:published_time"]'
+          ];
+          for (const sel of metaSelectors) {
+            const el = document.querySelector(sel);
+            if (el && el.content) { pubDate = el.content; break; }
+          }
+          // 2. JSON-LD datePublished
+          if (!pubDate) {
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            for (const s of scripts) {
+              try {
+                const data = JSON.parse(s.innerText);
+                const findDate = (obj) => {
+                  if (!obj || typeof obj !== 'object') return null;
+                  if (obj.datePublished) return obj.datePublished;
+                  if (Array.isArray(obj)) {
+                    for (const item of obj) {
+                      const d = findDate(item);
+                      if (d) return d;
+                    }
+                  }
+                  if (obj['@graph'] && Array.isArray(obj['@graph'])) {
+                    for (const item of obj['@graph']) {
+                      const d = findDate(item);
+                      if (d) return d;
+                    }
+                  }
+                  return null;
+                };
+                const d = findDate(data);
+                if (d) { pubDate = d; break; }
+              } catch (e) {}
+            }
+          }
+          // 3. <time> tag
+          if (!pubDate) {
+            const timeTag = document.querySelector('time[datetime]') || document.querySelector('time');
+            if (timeTag) {
+              pubDate = timeTag.getAttribute('datetime') || timeTag.innerText.trim();
+            }
+          }
+          return {
+            text: document.body.innerText,
+            published_date: pubDate || null
+          };
+        },
       });
-      payloadText = result.slice(0, 20000);
+      payloadText = result.text.slice(0, 20000);
+      publishedDate = result.published_date;
     }
 
     const connectStart = Date.now();
     statusDiv.innerHTML = "Connecting to backend...";
     
-    const { response, target } = await fetchBackendAnalysis(payloadText);
+    const { response, target } = await fetchBackendAnalysis(payloadText, publishedDate);
     const connectTime = ((Date.now() - connectStart) / 1000).toFixed(2);
-    console.log(`[Dialectic] Connected to ${target} in ${connectTime}s`);
+    console.log(`[Dialectic] Connected to ${target} in ${connectTime}s (Published date: ${publishedDate || "Unknown"})`);
 
     loading.style.display = "none";
 
@@ -124,13 +179,14 @@ document.getElementById("analyze").addEventListener("click", async () => {
   }
 });
 
-async function fetchBackendAnalysis(text) {
+async function fetchBackendAnalysis(text, publishedDate = null) {
   // Try local backend first (if running during development), otherwise fallback to production Render
+  const payload = JSON.stringify({ text, published_date: publishedDate });
   try {
     const localRes = await fetch("http://127.0.0.1:8000/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ text }),
+      body: payload,
     });
     if (localRes.ok) {
       return { response: localRes, target: "Local (127.0.0.1:8000)" };
@@ -142,7 +198,7 @@ async function fetchBackendAnalysis(text) {
   const renderRes = await fetch("https://dialectic-engine-pqdo.onrender.com/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({ text }),
+    body: payload,
   });
   return { response: renderRes, target: "Cloud (Render)" };
 }
@@ -159,23 +215,22 @@ function renderSummaryCard(summaryText, elapsed) {
 function renderSingleClaim(c, elapsed) {
   const output = document.getElementById("output");
   const badge = elapsed ? `<span style="float: right; font-size: 10px; color: #888; font-weight: normal;">⏱️ ${elapsed}</span>` : "";
+  const deadlineBadge = (c.time_bound && c.deadline_passed) 
+    ? `<span style="font-size: 10px; color: #d9534f; background: #fff1f0; border: 1px solid #ffa39e; border-radius: 3px; padding: 1px 5px; margin-left: 6px; font-weight: 500;">Prediction - deadline passed</span>` 
+    : "";
+
   const claimDiv = document.createElement("div");
   claimDiv.className = "card claim";
 
   const stance = (c.stance || "contested").toLowerCase();
 
-  if (stance === "supported") {
+  if (stance === "insufficient") {
     claimDiv.innerHTML = `
-      <strong>Claim:</strong>${badge} ${c.claim}
-      <div style="font-size: 12px; color: #28a745; margin-top: 6px;">Sources broadly support this claim.</div>
-    `;
-  } else if (stance === "insufficient") {
-    claimDiv.innerHTML = `
-      <strong>Claim:</strong>${badge} ${c.claim}
+      <strong>Claim:</strong>${badge} ${c.claim}${deadlineBadge}
       <div style="font-size: 12px; color: #888; font-style: italic; margin-top: 6px;">Couldn't find reliable evidence either way.</div>
     `;
   } else {
-    // "contested" or unspecified (v1 fallback): show full counterpoint and sources
+    // contested, supported, mixed (and v1 fallback): show summary/counterpoint + sources
     let sourcesHTML = "";
     if (c.sources && c.sources.length > 0) {
       const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
@@ -185,7 +240,7 @@ function renderSingleClaim(c, elapsed) {
     }
 
     claimDiv.innerHTML = `
-      <strong>Claim:</strong>${badge} ${c.claim}
+      <strong>Claim:</strong>${badge} ${c.claim}${deadlineBadge}
       <div class='counterpoint'>${c.counterpoint || "Analysis failed."}</div>
       ${sourcesHTML}
     `;
