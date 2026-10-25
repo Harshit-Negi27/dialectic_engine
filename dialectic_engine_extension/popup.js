@@ -167,12 +167,12 @@ function renderSingleClaim(c, elapsed) {
   if (stance === "supported") {
     claimDiv.innerHTML = `
       <strong>Claim:</strong>${badge} ${c.claim}
-      <div style="font-size: 12px; color: #28a745; margin-top: 6px;">Supported by current evidence and consensus.</div>
+      <div style="font-size: 12px; color: #28a745; margin-top: 6px;">Sources broadly support this claim.</div>
     `;
   } else if (stance === "insufficient") {
     claimDiv.innerHTML = `
       <strong>Claim:</strong>${badge} ${c.claim}
-      <div style="font-size: 12px; color: #888; font-style: italic; margin-top: 6px;">Insufficient contradictory evidence found.</div>
+      <div style="font-size: 12px; color: #888; font-style: italic; margin-top: 6px;">Couldn't find reliable evidence either way.</div>
     `;
   } else {
     // "contested" or unspecified (v1 fallback): show full counterpoint and sources

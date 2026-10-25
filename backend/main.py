@@ -20,8 +20,8 @@ init_db()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-# "v1" = original prompts, "v2" = improved prompts, "v3" = strict claim selection & direct challenge (default)
-PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v3")
+# "v1" = original prompts, "v2" = improved prompts, "v3" = strict claims, "v4" = scope check & claim cleanup (default)
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v4")
 
 EXCLUDE_DOMAINS = [
     "linkedin.com",
@@ -195,13 +195,78 @@ Text:
     return valid_claims
 
 
+async def agent_extract_claims_v4(text: str) -> list:
+    """Extractor v4 prompt. Adds hyperbole and attribution claim types with negative examples.
+    Drops claims whose type is definition, description, hyperbole, or attribution, or whose why_debatable is empty."""
+    system = (
+        "You select claims worth challenging. Be strict: quality over quantity. "
+        "Output JSON only."
+    )
+    user = f"""Analyze the following text and extract up to 4 claims worth challenging.
+
+A claim qualifies ONLY if ALL of these are true:
+- It asserts something about the world (a cause, prediction, ranking, recommendation, or statistic).
+- It is NOT a definition, description of what something is or how it works, or the author's framing ("this article explains...").
+- It is NOT hyperbole (rhetorical exaggeration or motivational statements) or attribution ("X said/believes Y").
+- A knowledgeable person could reasonably disagree, or credible evidence could exist against it.
+- It is specific enough to search for.
+
+Negative examples — DO NOT extract claims like these:
+- "GEO focuses on whether AI-generated answers mention your business" (definition)
+- "Superintelligence refers to AI that would outperform humans" (definition)
+- "MCP gives AI apps a standard way to connect to tools" (description of how it works)
+- "Understanding key terms puts you ahead of 90% of people" (hyperbole)
+- "The intelligence explosion could be much closer than expected according to Geoffrey Hinton" (attribution)
+
+Skip: definitions, descriptions of functionality, hyperbole, attributions, common knowledge, generic advice, and meta-commentary about the article itself.
+If fewer than 4 qualify, return fewer. If none qualify, return an empty list.
+
+For each claim:
+1. Rewrite it as a standalone sentence (no pronouns, no "the author says").
+2. Set "type" to exactly one of: "causal", "prediction", "evaluative", "statistical", "definition", "description", "hyperbole", "attribution".
+3. Write "why_debatable": one sentence explaining who could disagree and why.
+4. Write "search_query": 5-10 words aimed at finding evidence that CHALLENGES or LIMITS the claim — not one that restates it.
+
+Return JSON:
+{{"claims": [{{"claim": "...", "type": "causal|prediction|evaluative|statistical|definition|description|hyperbole|attribution", "why_debatable": "...", "search_query": "..."}}]}}
+
+Text:
+{text[:15000]}"""
+
+    data = await _safe_llm_json([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+    ])
+    if data is None:
+        return []
+
+    raw_claims = data.get("claims", [])
+    valid_claims = []
+    for item in raw_claims:
+        if not isinstance(item, dict):
+            continue
+        c_type = str(item.get("type", "")).strip().lower()
+        why_deb = str(item.get("why_debatable", "")).strip()
+
+        # In code, drop any claim whose type is definition, description, hyperbole, or attribution, or whose why_debatable is empty
+        if c_type in ("definition", "description", "hyperbole", "attribution"):
+            continue
+        if not why_deb:
+            continue
+        valid_claims.append(item)
+
+    return valid_claims
+
+
 async def agent_extract_claims(text: str) -> list:
-    """Dispatcher: routes to v1, v2, or v3 based on PROMPT_VERSION."""
+    """Dispatcher: routes to v1, v2, v3, or v4 based on PROMPT_VERSION."""
     if PROMPT_VERSION == "v1":
         return await agent_extract_claims_v1(text)
     if PROMPT_VERSION == "v2":
         return await agent_extract_claims_v2(text)
-    return await agent_extract_claims_v3(text)
+    if PROMPT_VERSION == "v3":
+        return await agent_extract_claims_v3(text)
+    return await agent_extract_claims_v4(text)
 
 
 # ── Counterpoint / RAG ───────────────────────────────────────────────────
@@ -381,13 +446,104 @@ Return JSON: {{"stance": "contested|supported|insufficient", "counterpoint": "..
     }
 
 
+async def agent_rag_and_counterpoint_v4(claim: str, search_query: str) -> dict:
+    """Counterpoint prompt v4. Adds evidence_measures and same_scope fields with strict inference rules.
+    If same_scope is false, forces stance to 'insufficient'."""
+    tavily_results = []
+    try:
+        response = await asyncio.to_thread(
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+        )
+        tavily_results = response.get('results', [])
+    except:
+        pass
+
+    if tavily_results:
+        source_blocks = []
+        for i, r in enumerate(tavily_results, start=1):
+            source_blocks.append(f"[{i}] URL: {r['url']}\nContent: {r['content']}")
+        sources_text = "\n\n".join(source_blocks)
+    else:
+        sources_text = "No sources found."
+
+    system = (
+        "You are a rigorous research assistant. Use ONLY the sources provided. "
+        "Never invent facts, numbers, or URLs. Output JSON only."
+    )
+    user = f"""Claim: "{claim}"
+
+Sources:
+{sources_text}
+
+Instructions:
+1. State the strongest evidence-based challenge to the claim using ONLY these sources.
+   The challenge must directly address what the claim asserts. Do not argue against a different or nearby point.
+   Cite every statement as [1], [2], etc.
+   2-3 sentences, max 70 words.
+2. In "evidence_measures", write a short phrase stating what the cited sources actually measure (population, metric, timeframe).
+3. In "same_scope", return true or false: does what the sources measure match what the claim asserts in population, metric AND timeframe?
+   Rules:
+   - Do not infer conclusions the source does not state (for example, do not turn 'X% plan to adopt' into 'the rest will not').
+   - If the sources measure something different from the claim, set same_scope to false.
+4. If the sources contain no real evidence against the claim, or if same_scope is false, say so honestly.
+5. Determine a stance:
+   - "contested" — sources contain concrete evidence against or limiting the claim (only if same_scope is true)
+   - "supported" — sources mostly back the claim
+   - "insufficient" — sources are irrelevant, measure a different scope, or are too thin to judge
+
+Return JSON:
+{{"evidence_measures": "...", "same_scope": true|false, "stance": "contested|supported|insufficient", "counterpoint": "... [1] ...", "cited": [1, 2]}}"""
+
+    data = await _safe_llm_json(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.2
+    )
+
+    if data is None:
+        return {
+            "stance": "insufficient",
+            "counterpoint": "Analysis failed.",
+            "sources": [],
+            "evidence_measures": "N/A",
+            "same_scope": False,
+            "raw_agent_output": None,
+            "tavily_count": len(tavily_results)
+        }
+
+    same_scope = bool(data.get("same_scope", False))
+    stance = data.get("stance", "insufficient")
+    # In code: if same_scope is false, treat the result as stance "insufficient"
+    if not same_scope:
+        stance = "insufficient"
+
+    cited_indices = data.get("cited", [])
+    real_sources = []
+    for idx in cited_indices:
+        if isinstance(idx, int) and 1 <= idx <= len(tavily_results):
+            url = tavily_results[idx - 1].get("url", "")
+            if url and url not in real_sources:
+                real_sources.append(url)
+
+    return {
+        "stance": stance,
+        "counterpoint": data.get("counterpoint", ""),
+        "sources": real_sources,
+        "evidence_measures": data.get("evidence_measures", ""),
+        "same_scope": same_scope,
+        "raw_agent_output": data,
+        "tavily_count": len(tavily_results),
+    }
+
+
 async def agent_rag_and_counterpoint(claim: str, search_query: str = "") -> dict:
-    """Dispatcher: routes to v1, v2, or v3 based on PROMPT_VERSION."""
+    """Dispatcher: routes to v1, v2, v3, or v4 based on PROMPT_VERSION."""
     if PROMPT_VERSION == "v1":
         return await agent_rag_and_counterpoint_v1(claim)
     if PROMPT_VERSION == "v2":
         return await agent_rag_and_counterpoint_v2(claim, search_query or claim)
-    return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
+    if PROMPT_VERSION == "v3":
+        return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
+    return await agent_rag_and_counterpoint_v4(claim, search_query or claim)
 
 
 # ── The Generator (Streaming Logic) ──────────────────────────────────────
@@ -414,7 +570,7 @@ async def analysis_generator(text: str):
     claims_raw = await claims_task
     
     if not claims_raw:
-        msg = "No strongly debatable claims found." if PROMPT_VERSION in ("v2", "v3") else "No claims found."
+        msg = "No strongly debatable claims found." if PROMPT_VERSION in ("v2", "v3", "v4") else "No claims found."
         yield json.dumps({"status": "no_claims", "message": msg}) + "\n"
         return
 
@@ -423,7 +579,7 @@ async def analysis_generator(text: str):
 
     # Process each claim: research facts with Tavily and generate counterpoint with OpenAI
     async def process_single_claim(claim_item):
-        # v2/v3 return dicts with {"claim": str, "search_query": str, ...}; v1 returns plain strings
+        # v2/v3/v4 return dicts with {"claim": str, "search_query": str, ...}; v1 returns plain strings
         if isinstance(claim_item, dict):
             claim_text = claim_item.get("claim", "")
             search_query = claim_item.get("search_query", claim_text)
@@ -435,10 +591,16 @@ async def analysis_generator(text: str):
         stance = res.get("stance", "contested" if PROMPT_VERSION == "v1" else "insufficient")
         raw_output = res.get("raw_agent_output", res)
         tavily_count = res.get("tavily_count", 0)
+        evidence_measures = res.get("evidence_measures", None)
+        same_scope = res.get("same_scope", None)
 
         # Logging to server console:
         print(f"\n[Claim Processed]: {claim_text}", flush=True)
         print(f"  • Tavily results returned: {tavily_count}", flush=True)
+        if evidence_measures is not None:
+            print(f"  • Evidence measures: {evidence_measures}", flush=True)
+        if same_scope is not None:
+            print(f"  • Same scope: {same_scope}", flush=True)
         print(f"  • Raw counterpoint output: {json.dumps(raw_output) if isinstance(raw_output, dict) else raw_output}", flush=True)
         print(f"  • Parsed stance: {stance}\n", flush=True)
 
