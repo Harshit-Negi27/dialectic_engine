@@ -105,6 +105,10 @@ document.getElementById("analyze").addEventListener("click", async () => {
               renderClaims(msg.data.claims, elapsed);
               claimsRenderedCount = msg.data.claims.length;
             }
+          } else if (msg.status === "no_claims") {
+            statusDiv.innerHTML = `<span style="font-size: 11px; color: #28a745; font-weight: bold;">[${target} • Finished in ${elapsed}]</span><br>Analysis Complete ✅`;
+            const output = document.getElementById("output");
+            output.innerHTML += `<div class="card" style="color: #666; font-style: italic; padding: 12px; margin-top: 8px;">${msg.message}</div>`;
           } else if (msg.status === "error") {
             statusDiv.innerHTML = `<span style="color:red">[${target}] Error: ${msg.message}</span>`;
           }
@@ -154,22 +158,39 @@ function renderSummaryCard(summaryText, elapsed) {
 
 function renderSingleClaim(c, elapsed) {
   const output = document.getElementById("output");
-  let sourcesHTML = "";
-  if (c.sources && c.sources.length > 0) {
-    const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
-    sourcesHTML = `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
-  } else {
-    sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
-  }
-  
   const badge = elapsed ? `<span style="float: right; font-size: 10px; color: #888; font-weight: normal;">⏱️ ${elapsed}</span>` : "";
   const claimDiv = document.createElement("div");
   claimDiv.className = "card claim";
-  claimDiv.innerHTML = `
-    <strong>Claim:</strong>${badge} ${c.claim}
-    <div class='counterpoint'>${c.counterpoint}</div>
-    ${sourcesHTML}
-  `;
+
+  const stance = (c.stance || "contested").toLowerCase();
+
+  if (stance === "supported") {
+    claimDiv.innerHTML = `
+      <strong>Claim:</strong>${badge} ${c.claim}
+      <div style="font-size: 12px; color: #28a745; margin-top: 6px;">Supported by current evidence and consensus.</div>
+    `;
+  } else if (stance === "insufficient") {
+    claimDiv.innerHTML = `
+      <strong>Claim:</strong>${badge} ${c.claim}
+      <div style="font-size: 12px; color: #888; font-style: italic; margin-top: 6px;">Insufficient contradictory evidence found.</div>
+    `;
+  } else {
+    // "contested" or unspecified (v1 fallback): show full counterpoint and sources
+    let sourcesHTML = "";
+    if (c.sources && c.sources.length > 0) {
+      const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
+      sourcesHTML = `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
+    } else {
+      sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
+    }
+
+    claimDiv.innerHTML = `
+      <strong>Claim:</strong>${badge} ${c.claim}
+      <div class='counterpoint'>${c.counterpoint || "Analysis failed."}</div>
+      ${sourcesHTML}
+    `;
+  }
+
   output.appendChild(claimDiv);
 }
 
