@@ -212,6 +212,134 @@ function renderSummaryCard(summaryText, elapsed) {
   output.appendChild(sumDiv);
 }
 
+function formatSources(sources) {
+  if (sources && sources.length > 0) {
+    const sourceLinks = sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
+    return `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
+  }
+  return `<div class='sources'><strong>Sources:</strong> None found.</div>`;
+}
+
+function getConsensusNote(consensus) {
+  const c = String(consensus || "").trim().toLowerCase();
+  if (c === "broad_agreement") {
+    return "Consensus: Broad expert agreement with claim (opposing argument is a minority view).";
+  }
+  if (c === "minority_dissent") {
+    return "Consensus: Claim is a minority view (critics hold the dominant expert position).";
+  }
+  if (c === "split") {
+    return "Consensus: Legitimate debate with divided expert opinions.";
+  }
+  return `Consensus: ${consensus || "Split debate"}`;
+}
+
+function getOrCreateV6Section(id, titleHtml) {
+  const output = document.getElementById("output");
+  let sec = document.getElementById(id);
+  if (!sec) {
+    sec = document.createElement("div");
+    sec.id = id;
+    sec.style.marginTop = "12px";
+    sec.innerHTML = titleHtml;
+    const alsoChecked = document.getElementById("section-also-checked");
+    if (alsoChecked) {
+      output.insertBefore(sec, alsoChecked);
+    } else {
+      output.appendChild(sec);
+    }
+  }
+  return sec;
+}
+
+function getOrCreateAlsoCheckedSection() {
+  const output = document.getElementById("output");
+  let sec = document.getElementById("section-also-checked");
+  if (!sec) {
+    sec = document.createElement("details");
+    sec.id = "section-also-checked";
+    sec.style.marginTop = "12px";
+    sec.style.border = "1px solid #e1e4e8";
+    sec.style.borderRadius = "6px";
+    sec.style.padding = "8px 10px";
+    sec.style.background = "#fafbfc";
+    sec.innerHTML = `
+      <summary id="summary-also-checked" style="cursor: pointer; font-weight: bold; font-size: 12px; color: #586069;">
+        Also checked: 0 claims hold up or lack a strong source
+      </summary>
+      <div id="content-also-checked" style="margin-top: 8px;"></div>
+    `;
+    output.appendChild(sec);
+  }
+  return sec;
+}
+
+function addToAlsoChecked(c, reason) {
+  getOrCreateAlsoCheckedSection();
+  const content = document.getElementById("content-also-checked");
+  const summaryEl = document.getElementById("summary-also-checked");
+
+  const item = document.createElement("div");
+  item.style.padding = "6px 0";
+  item.style.borderBottom = "1px solid #eaecef";
+  item.style.fontSize = "12px";
+  item.innerHTML = `
+    <strong>Claim:</strong> ${c.claim}
+    <div style="color: #6a737d; font-style: italic; margin-top: 2px;">${reason}</div>
+  `;
+  content.appendChild(item);
+
+  const count = content.children.length;
+  summaryEl.innerText = `Also checked: ${count} claim${count === 1 ? '' : 's'} hold up or lack a strong source`;
+}
+
+function renderV6Claim(c, elapsed, badge, deadlineBadge) {
+  const kind = String(c.claim_kind || "").toLowerCase();
+  const sourcesHTML = formatSources(c.sources);
+
+  if (kind === "contested") {
+    if (c.dropped || !c.who_argues) {
+      addToAlsoChecked(c, "No credible opposing argument found in sources.");
+      return;
+    }
+    const section = getOrCreateV6Section("section-other-side", '<h3 style="font-size: 14px; margin: 6px 0; color: #0969da;">The other side</h3>');
+    const card = document.createElement("div");
+    card.className = "card claim";
+    card.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <span style="font-size: 10px; background: #e8f4fd; color: #0969da; border: 1px solid #c8e1fb; border-radius: 3px; padding: 2px 6px; font-weight: 600;">Perspective, not a verdict</span>
+        ${badge}
+      </div>
+      <div style="font-size: 11px; color: #57606a; margin-bottom: 6px; font-style: italic;">${getConsensusNote(c.consensus)}</div>
+      <strong>Claim:</strong> ${c.claim}${deadlineBadge}
+      <div style="font-size: 12px; font-weight: 600; color: #333; margin-top: 6px;">Argued by: ${c.who_argues}</div>
+      <div class="counterpoint" style="margin-top: 4px;">${c.argument || c.counterpoint || ""}</div>
+      ${sourcesHTML}
+    `;
+    section.appendChild(card);
+    return;
+  }
+
+  // Factual claim
+  const stance = String(c.stance || "").toLowerCase();
+  if (stance === "contested") {
+    const section = getOrCreateV6Section("section-challenged", '<h3 style="font-size: 14px; margin: 6px 0; color: #cf222e;">Challenged</h3>');
+    const card = document.createElement("div");
+    card.className = "card claim";
+    card.innerHTML = `
+      <strong>Claim:</strong>${badge} ${c.claim}${deadlineBadge}
+      <div class="counterpoint">${c.counterpoint || "Evidence conflicts with claim."}</div>
+      ${sourcesHTML}
+    `;
+    section.appendChild(card);
+    return;
+  }
+
+  // Factual claim that holds up or lacks strong source
+  const reason = stance === "supported" ? "Sources back this claim." : "Holds up or lack of strong opposing source.";
+  addToAlsoChecked(c, reason);
+}
+
 function renderSingleClaim(c, elapsed) {
   const output = document.getElementById("output");
   const badge = elapsed ? `<span style="float: right; font-size: 10px; color: #888; font-weight: normal;">⏱️ ${elapsed}</span>` : "";
@@ -219,6 +347,12 @@ function renderSingleClaim(c, elapsed) {
     ? `<span style="font-size: 10px; color: #d9534f; background: #fff1f0; border: 1px solid #ffa39e; border-radius: 3px; padding: 1px 5px; margin-left: 6px; font-weight: 500;">Prediction - deadline passed</span>` 
     : "";
 
+  if (c.claim_kind) {
+    renderV6Claim(c, elapsed, badge, deadlineBadge);
+    return;
+  }
+
+  // Fallback for v1-v5 claims without claim_kind
   const claimDiv = document.createElement("div");
   claimDiv.className = "card claim";
 
@@ -231,13 +365,7 @@ function renderSingleClaim(c, elapsed) {
     `;
   } else {
     // contested, supported, mixed (and v1 fallback): show summary/counterpoint + sources
-    let sourcesHTML = "";
-    if (c.sources && c.sources.length > 0) {
-      const sourceLinks = c.sources.map(s => `<a href="${s}" target="_blank" rel="noopener noreferrer">${s}</a>`).join("<br>");
-      sourcesHTML = `<div class='sources'><strong>Sources:</strong><br>${sourceLinks}</div>`;
-    } else {
-      sourcesHTML = `<div class='sources'><strong>Sources:</strong> None found.</div>`;
-    }
+    const sourcesHTML = formatSources(c.sources);
 
     claimDiv.innerHTML = `
       <strong>Claim:</strong>${badge} ${c.claim}${deadlineBadge}

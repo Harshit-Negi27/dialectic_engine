@@ -21,8 +21,8 @@ init_db()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-# "v1" = original prompts, "v2" = improved prompts, "v3" = strict claims, "v4" = scope check, "v5" = evidence & verifier pipeline (default)
-PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v5")
+# "v1" = original prompts, "v2" = improved prompts, "v3" = strict claims, "v4" = scope check, "v5" = evidence & verifier, "v6" = perspective & contested/factual pipeline (default)
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v6")
 
 EXCLUDE_DOMAINS = [
     "linkedin.com",
@@ -332,8 +332,80 @@ Text:
     return valid_claims
 
 
+async def agent_extract_claims_v6(text: str) -> list:
+    """Extractor v6 prompt (based on v3 code path).
+    Per claim returns 'claim', 'claim_kind', 'why_debatable', 'search_query'.
+    claim_kind is 'contested' or 'factual'.
+    Drops definitions, descriptions, hyperbole, attribution claims, and truisms."""
+    system = (
+        "You select claims worth challenging. Be strict: quality over quantity. "
+        "Output JSON only."
+    )
+    user = f"""Analyze the following text and extract up to 4 claims worth challenging.
+
+A claim qualifies ONLY if ALL of these are true:
+- It asserts something about the world (a cause, prediction, ranking, recommendation, or statistic).
+- It is NOT a definition, description of what something is or how it works, or the author's framing ("this article explains...").
+- It is NOT hyperbole (rhetorical exaggeration or motivational statements) or attribution ("X said/believes Y").
+- It is NOT a truism or obvious common knowledge ("good health habits lead to longer lives").
+- A knowledgeable person or credible evidence could reasonably disagree or provide a strong alternative perspective.
+- It is specific enough to search for.
+
+Negative examples — DO NOT extract claims like these:
+- "GEO focuses on whether AI-generated answers mention your business" (definition)
+- "Superintelligence refers to AI that would outperform humans" (definition)
+- "MCP gives AI apps a standard way to connect to tools" (description of how it works)
+- "Understanding key terms puts you ahead of 90% of people" (hyperbole)
+- "The intelligence explosion could be much closer than expected according to Geoffrey Hinton" (attribution)
+- "Eating nutritious food improves physical health" (truism)
+
+Skip: definitions, descriptions of functionality, hyperbole, attributions, truisms, generic advice, and meta-commentary about the article itself.
+If fewer than 4 qualify, return fewer. If none qualify, return an empty list.
+
+For each claim:
+1. Rewrite it as a standalone sentence (no pronouns, no "the author says").
+2. Set "claim_kind" to:
+   - "contested": reasonable experts disagree on an empirical or evaluative question; forecasts count.
+   - "factual": a checkable number or event.
+   (If it is a definition, description, hyperbole, attribution, or truism, classify it as such so it can be discarded).
+3. Write "why_debatable": one sentence explaining who could disagree and why.
+4. Write "search_query" (5-10 words):
+   - For "contested" claims: search_query MUST target credible criticism or the opposing side (e.g. "arguments against X", "critics of X", "debate over X").
+   - For "factual" claims: use a neutral query aimed at checking or verifying the claim directly (as in v3).
+
+Return JSON:
+{{"claims": [{{"claim": "...", "claim_kind": "contested|factual", "why_debatable": "...", "search_query": "..."}}]}}
+
+Text:
+{text[:15000]}"""
+
+    data = await _safe_llm_json([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+    ])
+    if data is None:
+        return []
+
+    raw_claims = data.get("claims", [])
+    valid_claims = []
+    for item in raw_claims:
+        if not isinstance(item, dict):
+            continue
+        c_kind = str(item.get("claim_kind", "")).strip().lower()
+        why_deb = str(item.get("why_debatable", "")).strip()
+
+        # In code: keep only "contested" or "factual", drop definitions, descriptions, hyperbole, attributions, truisms, or empty why_debatable
+        if c_kind not in ("contested", "factual"):
+            continue
+        if not why_deb:
+            continue
+        valid_claims.append(item)
+
+    return valid_claims
+
+
 async def agent_extract_claims(text: str, published_date: str = None, today_date: str = None) -> list:
-    """Dispatcher: routes to v1, v2, v3, v4, or v5 based on PROMPT_VERSION."""
+    """Dispatcher: routes to v1, v2, v3, v4, v5, or v6 based on PROMPT_VERSION."""
     if PROMPT_VERSION == "v1":
         return await agent_extract_claims_v1(text)
     if PROMPT_VERSION == "v2":
@@ -342,7 +414,9 @@ async def agent_extract_claims(text: str, published_date: str = None, today_date
         return await agent_extract_claims_v3(text)
     if PROMPT_VERSION == "v4":
         return await agent_extract_claims_v4(text)
-    return await agent_extract_claims_v5(text, published_date=published_date, today_date=today_date)
+    if PROMPT_VERSION == "v5":
+        return await agent_extract_claims_v5(text, published_date=published_date, today_date=today_date)
+    return await agent_extract_claims_v6(text)
 
 
 # ── Counterpoint / RAG ───────────────────────────────────────────────────
@@ -776,8 +850,99 @@ async def agent_evidence_and_verify_v5(claim: str, settling_evidence: str, today
     }
 
 
-async def agent_rag_and_counterpoint(claim: str, search_query: str = "", settling_evidence: str = "", today_date: str = "") -> dict:
-    """Dispatcher: routes to v1, v2, v3, v4, or v5 based on PROMPT_VERSION."""
+async def agent_perspective_v6(claim: str, search_query: str) -> dict:
+    """Perspective agent v6 (for contested claims).
+    Searches Tavily with search_query (targeting credible criticism/opposing side).
+    Output JSON: consensus, who_argues, argument, cited.
+    Temperature: 0.2.
+    Maps cited to real URLs and drops the card if who_argues is empty."""
+    tavily_results = []
+    try:
+        response = await asyncio.to_thread(
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+        )
+        tavily_results = response.get('results', [])
+    except:
+        pass
+
+    if tavily_results:
+        source_blocks = []
+        for i, r in enumerate(tavily_results, start=1):
+            source_blocks.append(f"[{i}] URL: {r['url']}\nContent: {r['content']}")
+        sources_text = "\n\n".join(source_blocks)
+    else:
+        sources_text = "No sources found."
+
+    system = (
+        "You are an objective research assistant presenting alternative perspectives. "
+        "Use ONLY the sources provided. Never invent facts, numbers, or URLs. Output JSON only."
+    )
+    user = f"""Contested Claim: "{claim}"
+
+Sources:
+{sources_text}
+
+Instructions:
+1. Provide the strongest argument credible critics make against or limiting this claim using ONLY the provided sources.
+2. In "who_argues": name the specific organization, author, or study that makes the argument. If the sources contain no relevant credible opposing argument, leave who_argues empty ("").
+3. In "argument": summarize their counter-perspective. Include one concrete element (study, number, or case). Do NOT claim it proves the claim wrong. If the claim reflects broad expert consensus, say so and present the dissent as a minority view. Cite sources as [1] or [2]. Maximum 70 words.
+4. In "consensus": state the broader state of expert opinion on this question:
+   - "broad_agreement" — broad expert consensus agrees with the claim; the opposing view is minority dissent
+   - "split" — legitimate experts or evidence are divided on the issue
+   - "minority_dissent" — the claim itself represents a minority view; critics hold the dominant position
+5. In "cited": list the integer numbers of the sources cited (e.g. [1]).
+
+Return JSON:
+{{"consensus": "broad_agreement|split|minority_dissent", "who_argues": "named organization, author or study", "argument": "...", "cited": [1]}}"""
+
+    data = await _safe_llm_json(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.2
+    )
+
+    if data is None:
+        return {
+            "claim_kind": "contested",
+            "consensus": "split",
+            "who_argues": "",
+            "argument": "Analysis failed.",
+            "counterpoint": "Analysis failed.",
+            "sources": [],
+            "dropped": True,
+            "raw_agent_output": None,
+            "tavily_count": len(tavily_results),
+        }
+
+    who_argues = str(data.get("who_argues", "")).strip()
+    consensus = str(data.get("consensus", "split")).strip().lower()
+    argument = str(data.get("argument", "")).strip()
+    cited_indices = data.get("cited", [])
+
+    real_sources = []
+    for idx in cited_indices:
+        if isinstance(idx, int) and 1 <= idx <= len(tavily_results):
+            url = tavily_results[idx - 1].get("url", "")
+            if url and url not in real_sources:
+                real_sources.append(url)
+
+    # In code: drop the card if who_argues is empty
+    dropped = not bool(who_argues)
+
+    return {
+        "claim_kind": "contested",
+        "consensus": consensus,
+        "who_argues": who_argues,
+        "argument": argument,
+        "counterpoint": argument,
+        "sources": real_sources,
+        "dropped": dropped,
+        "raw_agent_output": data,
+        "tavily_count": len(tavily_results),
+    }
+
+
+async def agent_rag_and_counterpoint(claim: str, search_query: str = "", settling_evidence: str = "", today_date: str = "", claim_kind: str = "factual") -> dict:
+    """Dispatcher: routes to v1, v2, v3, v4, v5, or v6 based on PROMPT_VERSION."""
     if PROMPT_VERSION == "v1":
         return await agent_rag_and_counterpoint_v1(claim)
     if PROMPT_VERSION == "v2":
@@ -786,7 +951,12 @@ async def agent_rag_and_counterpoint(claim: str, search_query: str = "", settlin
         return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
     if PROMPT_VERSION == "v4":
         return await agent_rag_and_counterpoint_v4(claim, search_query or claim)
-    return await agent_evidence_and_verify_v5(claim, settling_evidence or "", today_date or date.today().isoformat(), search_query or claim)
+    if PROMPT_VERSION == "v5":
+        return await agent_evidence_and_verify_v5(claim, settling_evidence or "", today_date or date.today().isoformat(), search_query or claim)
+    # v6
+    if claim_kind == "contested":
+        return await agent_perspective_v6(claim, search_query or claim)
+    return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
 
 
 # ── The Generator (Streaming Logic) ──────────────────────────────────────
@@ -817,7 +987,7 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
     claims_raw = await claims_task
     
     if not claims_raw:
-        msg = "No strongly debatable claims found." if PROMPT_VERSION in ("v2", "v3", "v4", "v5") else "No claims found."
+        msg = "No strongly debatable claims found." if PROMPT_VERSION in ("v2", "v3", "v4", "v5", "v6") else "No claims found."
         yield json.dumps({"status": "no_claims", "message": msg}) + "\n"
         return
 
@@ -828,12 +998,14 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
     async def process_single_claim(claim_item):
         if isinstance(claim_item, dict):
             claim_text = claim_item.get("claim", "")
+            claim_kind = claim_item.get("claim_kind", "factual")
             search_query = claim_item.get("search_query", claim_text)
             settling_evidence = claim_item.get("settling_evidence", "")
             time_bound = bool(claim_item.get("time_bound", False))
             deadline = claim_item.get("deadline", None)
         else:
             claim_text = str(claim_item)
+            claim_kind = "factual"
             search_query = claim_text
             settling_evidence = ""
             time_bound = False
@@ -849,7 +1021,15 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
             except:
                 pass
 
-        res = await agent_rag_and_counterpoint(claim_text, search_query, settling_evidence, today_date)
+        if PROMPT_VERSION == "v6":
+            if claim_kind == "contested":
+                res = await agent_perspective_v6(claim_text, search_query)
+            else:
+                res = await agent_rag_and_counterpoint_v3(claim_text, search_query)
+                res["claim_kind"] = "factual"
+        else:
+            res = await agent_rag_and_counterpoint(claim_text, search_query, settling_evidence, today_date)
+
         stance = res.get("stance", "contested" if PROMPT_VERSION == "v1" else "insufficient")
         raw_output = res.get("raw_agent_output", res)
         tavily_count = res.get("tavily_count", 0)
@@ -857,22 +1037,35 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
         measures = res.get("measures", None)
         verifier_output = res.get("verifier_output", None)
 
-        # Logging to server console:
-        print(f"\n[Claim Processed]: {claim_text}", flush=True)
-        print(f"  • Tavily results returned: {tavily_count}", flush=True)
-        if key_quote is not None:
-            print(f"  • Key quote: '{key_quote}' (quote_valid={res.get('quote_valid')})", flush=True)
-        if measures is not None:
-            print(f"  • Measures: {measures}", flush=True)
-        if verifier_output is not None:
-            print(f"  • Verifier Output: {json.dumps(verifier_output)}", flush=True)
-        print(f"  • Parsed stance: {stance}\n", flush=True)
+        # Logging per claim:
+        if PROMPT_VERSION == "v6":
+            print(f"\n[Claim Processed (v6)]: {claim_text}", flush=True)
+            print(f"  • Claim kind: {claim_kind}", flush=True)
+            print(f"  • Search query: {search_query}", flush=True)
+            print(f"  • Tavily results count: {tavily_count}", flush=True)
+            raw_str = json.dumps(raw_output) if isinstance(raw_output, dict) else str(raw_output)
+            print(f"  • Raw agent output: {raw_str}\n", flush=True)
+        else:
+            print(f"\n[Claim Processed]: {claim_text}", flush=True)
+            print(f"  • Tavily results returned: {tavily_count}", flush=True)
+            if key_quote is not None:
+                print(f"  • Key quote: '{key_quote}' (quote_valid={res.get('quote_valid')})", flush=True)
+            if measures is not None:
+                print(f"  • Measures: {measures}", flush=True)
+            if verifier_output is not None:
+                print(f"  • Verifier Output: {json.dumps(verifier_output)}", flush=True)
+            print(f"  • Parsed stance: {stance}\n", flush=True)
 
         return {
             "claim": claim_text,
-            "counterpoint": res.get("summary") or res.get("counterpoint", "Analysis failed."),
+            "claim_kind": claim_kind,
+            "counterpoint": res.get("summary") or res.get("argument") or res.get("counterpoint", "Analysis failed."),
             "sources": res.get("sources", []),
             "stance": stance,
+            "consensus": res.get("consensus", None),
+            "who_argues": res.get("who_argues", None),
+            "argument": res.get("argument", None),
+            "dropped": res.get("dropped", False),
             "time_bound": time_bound,
             "deadline": deadline,
             "deadline_passed": deadline_passed,
