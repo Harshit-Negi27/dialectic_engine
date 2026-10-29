@@ -11,6 +11,7 @@ from datetime import date
 from dotenv import load_dotenv
 from pathlib import Path
 
+from urllib.parse import urlparse
 from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
 from backend.youtube_utils import get_transcript_text
 
@@ -64,6 +65,42 @@ async def _safe_llm_json(messages: list, temperature: float = 0.2, retries: int 
             return None
         except Exception:
             return None
+
+
+def normalize_url(url: str) -> str:
+    """Normalize URL by stripping protocol, www, trailing slash, query params, and fragments."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        path = parsed.path.rstrip("/")
+        return f"{netloc}{path}".lower()
+    except Exception:
+        return url.strip().rstrip("/").lower()
+
+
+def filter_and_dedupe_tavily_results(results: list, page_url: str = "") -> list:
+    """Drop any Tavily result matching the page URL and dedupe by normalized URL."""
+    norm_page = normalize_url(page_url) if page_url else ""
+    seen_urls = set()
+    cleaned = []
+    for r in results:
+        url = r.get("url", "")
+        if not url:
+            continue
+        norm_r = normalize_url(url)
+        # Drop if matches the page being analyzed
+        if norm_page and norm_r == norm_page:
+            continue
+        # Dedupe by URL
+        if norm_r in seen_urls:
+            continue
+        seen_urls.add(norm_r)
+        cleaned.append(r)
+    return cleaned
 
 
 # ── Summarizer (unchanged across versions) ───────────────────────────────
@@ -427,7 +464,7 @@ async def agent_rag_and_counterpoint_v1(claim: str) -> dict:
     tavily_count = 0
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=claim, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=claim, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         results = response.get('results', [])
         tavily_count = len(results)
@@ -464,7 +501,7 @@ async def agent_rag_and_counterpoint_v2(claim: str, search_query: str) -> dict:
     tavily_results = []
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         tavily_results = response.get('results', [])
     except:
@@ -527,14 +564,15 @@ Return JSON: {{"stance": "contested|supported|insufficient", "counterpoint": "..
     }
 
 
-async def agent_rag_and_counterpoint_v3(claim: str, search_query: str) -> dict:
+async def agent_rag_and_counterpoint_v3(claim: str, search_query: str, page_url: str = "") -> dict:
     """Counterpoint prompt v3. Adds the strict direct challenge rule and excludes domains."""
     tavily_results = []
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
-        tavily_results = response.get('results', [])
+        raw_results = response.get('results', [])
+        tavily_results = filter_and_dedupe_tavily_results(raw_results, page_url)
     except:
         pass
 
@@ -602,7 +640,7 @@ async def agent_rag_and_counterpoint_v4(claim: str, search_query: str) -> dict:
     tavily_results = []
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         tavily_results = response.get('results', [])
     except:
@@ -692,7 +730,7 @@ async def agent_evidence_v5(claim: str, settling_evidence: str, today_date: str,
     tavily_results = []
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         tavily_results = response.get('results', [])
     except:
@@ -850,18 +888,20 @@ async def agent_evidence_and_verify_v5(claim: str, settling_evidence: str, today
     }
 
 
-async def agent_perspective_v6(claim: str, search_query: str) -> dict:
+async def agent_perspective_v6(claim: str, search_query: str, page_url: str = "") -> dict:
     """Perspective agent v6 (for contested claims).
     Searches Tavily with search_query (targeting credible criticism/opposing side).
     Output JSON: consensus, who_argues, argument, cited.
     Temperature: 0.2.
-    Maps cited to real URLs and drops the card if who_argues is empty."""
+    Prompt text is unchanged.
+    In code: maps cited to real URLs and treats who_argues as optional."""
     tavily_results = []
     try:
         response = await asyncio.to_thread(
-            tavily_client.search, query=search_query, search_depth="advanced", max_results=2, exclude_domains=EXCLUDE_DOMAINS
+            tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
-        tavily_results = response.get('results', [])
+        raw_results = response.get('results', [])
+        tavily_results = filter_and_dedupe_tavily_results(raw_results, page_url)
     except:
         pass
 
@@ -908,7 +948,8 @@ Return JSON:
             "argument": "Analysis failed.",
             "counterpoint": "Analysis failed.",
             "sources": [],
-            "dropped": True,
+            "show_card": False,
+            "hidden_reason": "LLM analysis failed",
             "raw_agent_output": None,
             "tavily_count": len(tavily_results),
         }
@@ -925,8 +966,12 @@ Return JSON:
             if url and url not in real_sources:
                 real_sources.append(url)
 
-    # In code: drop the card if who_argues is empty
-    dropped = not bool(who_argues)
+    # Task 7 rule:
+    # Remove the who_argues gate. For contested claims, show a card when
+    # "argument" is non-empty AND at least one valid index in "cited" maps to a real source.
+    # Treat who_argues as optional (ignore it if empty).
+    show_card = bool(argument) and len(real_sources) >= 1
+    hidden_reason = "" if show_card else ("Argument is empty" if not argument else "No cited source mapped to a real URL")
 
     return {
         "claim_kind": "contested",
@@ -935,47 +980,48 @@ Return JSON:
         "argument": argument,
         "counterpoint": argument,
         "sources": real_sources,
-        "dropped": dropped,
+        "show_card": show_card,
+        "hidden_reason": hidden_reason,
         "raw_agent_output": data,
         "tavily_count": len(tavily_results),
     }
 
 
-async def agent_rag_and_counterpoint(claim: str, search_query: str = "", settling_evidence: str = "", today_date: str = "", claim_kind: str = "factual") -> dict:
+async def agent_rag_and_counterpoint(claim: str, search_query: str = "", settling_evidence: str = "", today_date: str = "", claim_kind: str = "factual", page_url: str = "") -> dict:
     """Dispatcher: routes to v1, v2, v3, v4, v5, or v6 based on PROMPT_VERSION."""
     if PROMPT_VERSION == "v1":
         return await agent_rag_and_counterpoint_v1(claim)
     if PROMPT_VERSION == "v2":
         return await agent_rag_and_counterpoint_v2(claim, search_query or claim)
     if PROMPT_VERSION == "v3":
-        return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
+        return await agent_rag_and_counterpoint_v3(claim, search_query or claim, page_url=page_url)
     if PROMPT_VERSION == "v4":
         return await agent_rag_and_counterpoint_v4(claim, search_query or claim)
     if PROMPT_VERSION == "v5":
         return await agent_evidence_and_verify_v5(claim, settling_evidence or "", today_date or date.today().isoformat(), search_query or claim)
     # v6
     if claim_kind == "contested":
-        return await agent_perspective_v6(claim, search_query or claim)
-    return await agent_rag_and_counterpoint_v3(claim, search_query or claim)
+        return await agent_perspective_v6(claim, search_query or claim, page_url=page_url)
+    return await agent_rag_and_counterpoint_v3(claim, search_query or claim, page_url=page_url)
 
 
 # ── The Generator (Streaming Logic) ──────────────────────────────────────
 
-async def analysis_generator(text: str, published_date: str = None, today_date: str = None):
+async def analysis_generator(text: str, published_date: str = None, today_date: str = None, page_url: str = ""):
     """Yields chunks of data as they become available."""
     if not today_date:
         today_date = date.today().isoformat()
 
-    print(f"\n[Analysis Generator] Today: {today_date} | Published: {published_date}", flush=True)
+    print(f"\n[Analysis Generator] Today: {today_date} | Published: {published_date} | Page URL: {page_url} | Version: {PROMPT_VERSION}", flush=True)
 
-    # Check cache
-    cached = await asyncio.to_thread(get_cached_analysis, text)
+    # Check cache with PROMPT_VERSION included
+    cached = await asyncio.to_thread(get_cached_analysis, text, PROMPT_VERSION)
     if cached:
         yield json.dumps({"status": "complete", "data": cached}) + "\n"
         return
 
     # Launch Summary and Claim Extraction concurrently
-    yield json.dumps({"status": "progress", "message": " Analyzing content & extracting claims..."}) + "\n"
+    yield json.dumps({"status": "progress", "message": "Analyzing content & extracting claims..."}) + "\n"
     summary_task = asyncio.create_task(agent_summarize(text))
     claims_task = asyncio.create_task(agent_extract_claims(text, published_date=published_date, today_date=today_date))
 
@@ -992,10 +1038,14 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
         return
 
     total_claims = len(claims_raw)
-    yield json.dumps({"status": "progress", "message": f" Verifying {total_claims} claims in parallel..."}) + "\n"
+    yield json.dumps({
+        "status": "progress",
+        "message": f"Checking {total_claims} claims...",
+        "total_claims": total_claims
+    }) + "\n"
 
     # Process each claim: research facts with Tavily and verify evidence
-    async def process_single_claim(claim_item):
+    async def process_single_claim(claim_item, order_index: int):
         if isinstance(claim_item, dict):
             claim_text = claim_item.get("claim", "")
             claim_kind = claim_item.get("claim_kind", "factual")
@@ -1023,12 +1073,24 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
 
         if PROMPT_VERSION == "v6":
             if claim_kind == "contested":
-                res = await agent_perspective_v6(claim_text, search_query)
+                res = await agent_perspective_v6(claim_text, search_query, page_url=page_url)
+                show_card = res.get("show_card", False)
+                hidden_reason = res.get("hidden_reason", "")
             else:
-                res = await agent_rag_and_counterpoint_v3(claim_text, search_query)
+                res = await agent_rag_and_counterpoint_v3(claim_text, search_query, page_url=page_url)
                 res["claim_kind"] = "factual"
+                stance = res.get("stance", "insufficient")
+                show_card = (stance == "contested" and len(res.get("sources", [])) >= 1)
+                hidden_reason = "" if show_card else f"Factual claim stance '{stance}' (sources did not conflict)"
+                res["show_card"] = show_card
+                res["hidden_reason"] = hidden_reason
         else:
-            res = await agent_rag_and_counterpoint(claim_text, search_query, settling_evidence, today_date)
+            res = await agent_rag_and_counterpoint(claim_text, search_query, settling_evidence, today_date, page_url=page_url)
+            stance = res.get("stance", "contested" if PROMPT_VERSION == "v1" else "insufficient")
+            show_card = (stance == "contested" and len(res.get("sources", [])) >= 1)
+            hidden_reason = "" if show_card else f"Stance '{stance}'"
+            res["show_card"] = show_card
+            res["hidden_reason"] = hidden_reason
 
         stance = res.get("stance", "contested" if PROMPT_VERSION == "v1" else "insufficient")
         raw_output = res.get("raw_agent_output", res)
@@ -1037,26 +1099,28 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
         measures = res.get("measures", None)
         verifier_output = res.get("verifier_output", None)
 
-        # Logging per claim:
+        # Logging per claim (whether it was shown or hidden and the reason):
+        print(f"\n[Claim {order_index + 1}/{total_claims}]: {claim_text}", flush=True)
         if PROMPT_VERSION == "v6":
-            print(f"\n[Claim Processed (v6)]: {claim_text}", flush=True)
             print(f"  • Claim kind: {claim_kind}", flush=True)
             print(f"  • Search query: {search_query}", flush=True)
-            print(f"  • Tavily results count: {tavily_count}", flush=True)
+            print(f"  • Tavily count: {tavily_count}", flush=True)
             raw_str = json.dumps(raw_output) if isinstance(raw_output, dict) else str(raw_output)
-            print(f"  • Raw agent output: {raw_str}\n", flush=True)
+            print(f"  • Raw agent output: {raw_str}", flush=True)
         else:
-            print(f"\n[Claim Processed]: {claim_text}", flush=True)
-            print(f"  • Tavily results returned: {tavily_count}", flush=True)
+            print(f"  • Tavily count: {tavily_count}", flush=True)
             if key_quote is not None:
-                print(f"  • Key quote: '{key_quote}' (quote_valid={res.get('quote_valid')})", flush=True)
-            if measures is not None:
-                print(f"  • Measures: {measures}", flush=True)
+                print(f"  • Key quote: '{key_quote}'", flush=True)
             if verifier_output is not None:
-                print(f"  • Verifier Output: {json.dumps(verifier_output)}", flush=True)
-            print(f"  • Parsed stance: {stance}\n", flush=True)
+                print(f"  • Verifier: {json.dumps(verifier_output)}", flush=True)
+
+        if show_card:
+            print(f"  • UI Decision: SHOWN on UI (displayable counterpoint, {len(res.get('sources', []))} sources)\n", flush=True)
+        else:
+            print(f"  • UI Decision: HIDDEN from UI ({hidden_reason})\n", flush=True)
 
         return {
+            "order_index": order_index,
             "claim": claim_text,
             "claim_kind": claim_kind,
             "counterpoint": res.get("summary") or res.get("argument") or res.get("counterpoint", "Analysis failed."),
@@ -1065,13 +1129,14 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
             "consensus": res.get("consensus", None),
             "who_argues": res.get("who_argues", None),
             "argument": res.get("argument", None),
-            "dropped": res.get("dropped", False),
+            "show_card": show_card,
+            "hidden_reason": hidden_reason,
             "time_bound": time_bound,
             "deadline": deadline,
             "deadline_passed": deadline_passed,
         }
 
-    claim_tasks = [asyncio.create_task(process_single_claim(c)) for c in claims_raw]
+    claim_tasks = [asyncio.create_task(process_single_claim(c, idx)) for idx, c in enumerate(claims_raw)]
     
     full_claims_data = []
     completed_count = 0
@@ -1084,14 +1149,17 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
         yield json.dumps({
             "status": "claim_ready",
             "claim": claim_obj,
-            "progress": f"Verified {completed_count}/{total_claims} claims"
+            "progress": f"Checking {total_claims} claims..."
         }) + "\n"
+
+    # Sort full_claims_data back to original order for final payload and caching
+    full_claims_data.sort(key=lambda x: x.get("order_index", 0))
 
     # Final payload
     final_data = {"summary": summary, "claims": full_claims_data}
     
-    # Save to Cache
-    await asyncio.to_thread(save_analysis_to_cache, text, final_data)
+    # Save to Cache with version
+    await asyncio.to_thread(save_analysis_to_cache, text, final_data, PROMPT_VERSION)
     
     yield json.dumps({"status": "complete", "data": final_data}) + "\n"
 
@@ -1109,6 +1177,7 @@ async def analyze(req: Request):
     data = await req.json()
     raw_text = data.get("text", "")
     published_date = data.get("published_date", None)
+    page_url = data.get("page_url", "")
     today_date = date.today().isoformat()
     
     # Handle YouTube
@@ -1123,7 +1192,7 @@ async def analyze(req: Request):
             )
 
     return StreamingResponse(
-        analysis_generator(raw_text, published_date=published_date, today_date=today_date),
+        analysis_generator(raw_text, published_date=published_date, today_date=today_date, page_url=page_url),
         media_type="application/x-ndjson",
         headers={
             "Cache-Control": "no-cache",

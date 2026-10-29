@@ -31,9 +31,10 @@ def init_db():
     if deleted_count > 0:
         print(f"CLEANUP: Removed {deleted_count} expired records from cache.")
 
-def get_cached_analysis(text: str):
-    """Checks for a valid, non-expired cache hit."""
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+def get_cached_analysis(text: str, version: str = ""):
+    """Checks for a valid, non-expired cache hit using text and version."""
+    raw_key = f"{version}:{text}" if version else text
+    text_hash = hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
     
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -42,13 +43,14 @@ def get_cached_analysis(text: str):
     conn.close()
     
     if row:
-        print(f" CACHE HIT! Returning saved result for hash: {text_hash[:8]}...")
+        print(f" CACHE HIT! Returning saved result for hash: {text_hash[:8]}... (version: {version or 'none'})")
         return json.loads(row[0])
     return None
 
-def save_analysis_to_cache(text: str, data: dict):
-    """Saves the result with the current timestamp."""
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+def save_analysis_to_cache(text: str, data: dict, version: str = ""):
+    """Saves the result with current timestamp using text and version."""
+    raw_key = f"{version}:{text}" if version else text
+    text_hash = hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
     current_time = time.time() 
     
     conn = sqlite3.connect(DB_PATH)
