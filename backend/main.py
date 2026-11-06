@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 from urllib.parse import urlparse
+import time
+import math
 from backend.database import init_db, get_cached_analysis, save_analysis_to_cache
 from backend.youtube_utils import get_transcript_text
 
@@ -25,14 +27,76 @@ tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 # "v1" = original prompts, "v2" = improved prompts, "v3" = strict claims, "v4" = scope check, "v5" = evidence & verifier, "v6" = perspective & contested/factual pipeline (default)
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v6")
 
-EXCLUDE_DOMAINS = [
-    "linkedin.com",
-    "facebook.com",
+# Task 9 configurations:
+COUNTERPOINT_MODEL = os.getenv("COUNTERPOINT_MODEL", "gpt-4o-mini")
+RELEVANCE_MODE = os.getenv("RELEVANCE_MODE", "log").strip().lower()  # "off" | "log" | "enforce"
+try:
+    RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.25"))
+except ValueError:
+    RELEVANCE_THRESHOLD = 0.25
+
+# Hard drop by domain: social, repost sites, and aggregators
+HARD_DROP_DOMAINS = [
+    "bsky.app",
     "x.com",
     "twitter.com",
+    "reddit.com",
+    "linkedin.com",
+    "facebook.com",
     "instagram.com",
+    "tiktok.com",
+    "youtube.com",
     "pinterest.com",
+    "news.google.com",
+    "msn.com",
+    "flipboard.com",
+    "newsbreak.com",
 ]
+
+# Priority ordering (reorder, do NOT drop):
+# Tier 1: authoritative / institutional (.gov, .edu, top research/stats and major news outlets)
+# Tier 2: default
+# Tier 3: vendor/marketing blogs
+PRIORITY_TIER_1_DOMAINS = [
+    ".gov",
+    ".edu",
+    "reuters.com",
+    "apnews.com",
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "nature.com",
+    "science.org",
+    "bbc.com",
+    "bbc.co.uk",
+    "nytimes.com",
+    "washingtonpost.com",
+    "theguardian.com",
+    "economist.com",
+    "pewresearch.org",
+    "statista.com",
+    "who.int",
+    "cdc.gov",
+    "nih.gov",
+    "arxiv.org",
+    "nber.org",
+]
+
+PRIORITY_TIER_3_DOMAINS = [
+    "medium.com",
+    "substack.com",
+    "hubspot.com",
+    "salesforce.com",
+    "zapier.com",
+    "mailchimp.com",
+    "semrush.com",
+    "ahrefs.com",
+    "wordpress.com",
+    "blogspot.com",
+]
+
+# Backward compatibility alias
+EXCLUDE_DOMAINS = HARD_DROP_DOMAINS
 
 app = FastAPI()
 
@@ -67,6 +131,39 @@ async def _safe_llm_json(messages: list, temperature: float = 0.2, retries: int 
             return None
 
 
+async def _safe_llm_json_counterpoint(messages: list, temperature: float = 0.2, retries: int = 1) -> tuple[dict | None, str, float]:
+    """Call COUNTERPOINT_MODEL with json_object format and a 20s timeout.
+    If it errors or times out, retries once with previous default (gpt-4o-mini) and logs fallback.
+    Returns: (parsed_data, model_used, latency_seconds)."""
+    target_model = COUNTERPOINT_MODEL or "gpt-4o-mini"
+    start_time = time.time()
+    
+    # 1. Attempt with target_model under 20s timeout
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=target_model,
+                temperature=temperature,
+                response_format={"type": "json_object"},
+                messages=messages,
+            ),
+            timeout=20.0
+        )
+        latency = time.time() - start_time
+        data = json.loads(resp.choices[0].message.content)
+        return data, target_model, latency
+    except Exception as e:
+        fallback_reason = "timeout (>20s)" if isinstance(e, asyncio.TimeoutError) else f"error ({type(e).__name__}: {e})"
+        print(f"  ⚠️ [COUNTERPOINT_MODEL fallback] Model '{target_model}' failed due to {fallback_reason}. Retrying with 'gpt-4o-mini'...", flush=True)
+
+    # 2. Fallback to gpt-4o-mini
+    fallback_start = time.time()
+    fallback_model = "gpt-4o-mini"
+    data = await _safe_llm_json(messages, temperature=temperature, retries=retries)
+    latency = time.time() - fallback_start
+    return data, fallback_model, latency
+
+
 def normalize_url(url: str) -> str:
     """Normalize URL by stripping protocol, www, trailing slash, query params, and fragments."""
     if not url:
@@ -82,25 +179,190 @@ def normalize_url(url: str) -> str:
         return url.strip().rstrip("/").lower()
 
 
-def filter_and_dedupe_tavily_results(results: list, page_url: str = "") -> list:
-    """Drop any Tavily result matching the page URL and dedupe by normalized URL."""
+def _matches_domain_pattern(netloc: str, pattern: str) -> bool:
+    """Check if a netloc matches a domain pattern (e.g. '.gov', 'x.com', 'news.google.com')."""
+    pattern = pattern.lower().strip()
+    netloc = netloc.lower().strip()
+    if pattern.startswith("."):
+        return netloc.endswith(pattern)
+    return netloc == pattern or netloc.endswith("." + pattern)
+
+
+def _get_domain_priority_rank(url: str) -> int:
+    """Returns priority rank (lower is higher priority).
+    Rank 0: Tier 1 (.gov, .edu, top research/stats, major news)
+    Rank 1: Tier 2 (default)
+    Rank 2: Tier 3 (vendor, marketing, self-publishing blogs)"""
+    try:
+        parsed = urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        for p in PRIORITY_TIER_1_DOMAINS:
+            if _matches_domain_pattern(netloc, p):
+                return 0
+        for p in PRIORITY_TIER_3_DOMAINS:
+            if _matches_domain_pattern(netloc, p):
+                return 2
+        return 1
+    except Exception:
+        return 1
+
+
+def filter_and_dedupe_tavily_results(results: list, page_url: str = "", claim_text: str = "") -> list:
+    """Filter Tavily results following Task 9 Part B rules:
+    Stage 1: Hard drop by domain (social, repost, aggregators, page being analyzed), dedupe by normalized URL.
+    Stage 2: Priority ordering (Tier 1 first, Tier 3 last).
+    Stage 3: Relevance scoring via embeddings (if RELEVANCE_MODE != 'off').
+    Logs detailed per-claim breakdown of before/after counts and reasons."""
+    count_initial = len(results)
     norm_page = normalize_url(page_url) if page_url else ""
     seen_urls = set()
     cleaned = []
+    dropped_reasons = []
+
+    # ── Stage 1: Hard drop & dedupe ──────────────────────────────────────────
     for r in results:
         url = r.get("url", "")
         if not url:
+            dropped_reasons.append(("[empty url]", "missing URL"))
             continue
+
         norm_r = normalize_url(url)
-        # Drop if matches the page being analyzed
+
+        # Check analyzed page URL
         if norm_page and norm_r == norm_page:
+            dropped_reasons.append((url, "matches analyzed page URL"))
             continue
-        # Dedupe by URL
+
+        # Check deduplication
         if norm_r in seen_urls:
+            dropped_reasons.append((url, "duplicate URL"))
             continue
+
+        # Check hard drop domains
+        netloc = ""
+        try:
+            parsed = urlparse(url.strip())
+            netloc = parsed.netloc.lower()
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+        except Exception:
+            pass
+
+        is_hard_dropped = False
+        for bad_domain in HARD_DROP_DOMAINS:
+            if _matches_domain_pattern(netloc, bad_domain):
+                dropped_reasons.append((url, f"hard-drop domain ({bad_domain})"))
+                is_hard_dropped = True
+                break
+        if is_hard_dropped:
+            continue
+
         seen_urls.add(norm_r)
         cleaned.append(r)
+
+    count_after_hard_drop = len(cleaned)
+
+    # ── Stage 2: Priority ordering (reorder, do NOT drop) ─────────────────────
+    # Sort stably so original ranking is preserved within the same priority tier
+    cleaned.sort(key=lambda r: _get_domain_priority_rank(r.get("url", "")))
+    count_after_priority = len(cleaned)
+
+    # Logging telemetry for stages 1 & 2
+    if claim_text or dropped_reasons or count_initial != count_after_priority:
+        claim_summary = f" for '{claim_text[:40]}...'" if claim_text else ""
+        print(f"  🔍 [Source Filtering{claim_summary}]:", flush=True)
+        print(f"     • Count: initial={count_initial} -> after hard-drop/dedupe={count_after_hard_drop} -> after priority-sort={count_after_priority}", flush=True)
+        if dropped_reasons:
+            for d_url, d_reason in dropped_reasons:
+                print(f"     • Dropped: {d_url} (Reason: {d_reason})", flush=True)
+
     return cleaned
+
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    """Compute cosine similarity between two float vectors."""
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for a, b in zip(vec_a, vec_b):
+        dot += a * b
+        norm_a += a * a
+        norm_b += b * b
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+
+async def apply_relevance_filter(claim: str, results: list) -> tuple[list, list[dict], str]:
+    """Task 9 Part B.3: Relevance check using OpenAI text-embedding-3-small in one batched call.
+    Computes cosine similarity between the claim and (title + first 600 chars of content) for each source.
+    - RELEVANCE_MODE == 'off': returns results unchanged.
+    - RELEVANCE_MODE == 'log': logs scores, returns results unchanged.
+    - RELEVANCE_MODE == 'enforce': drops sources with similarity < RELEVANCE_THRESHOLD.
+    Returns: (filtered_results, score_records, hidden_reason_if_empty)."""
+    if not results:
+        return [], [], "No sources available"
+    if RELEVANCE_MODE == "off":
+        return results, [], ""
+
+    # Build batched inputs: claim at index 0, followed by each source text
+    source_texts = []
+    for r in results:
+        title = r.get("title", "") or ""
+        content = (r.get("content", "") or "")[:600]
+        combined = f"{title}\n{content}".strip()
+        source_texts.append(combined if combined else "No content")
+
+    inputs = [claim] + source_texts
+    try:
+        emb_resp = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=inputs
+        )
+        embeddings = [item.embedding for item in emb_resp.data]
+        claim_emb = embeddings[0]
+        source_embs = embeddings[1:]
+    except Exception as e:
+        print(f"  ⚠️ [Relevance Check] Embedding call failed ({e}). Proceeding without relevance filtering.", flush=True)
+        return results, [], ""
+
+    score_records = []
+    surviving_results = []
+    dropped_sources = []
+
+    for r, s_emb in zip(results, source_embs):
+        sim = _cosine_similarity(claim_emb, s_emb)
+        score_records.append({
+            "url": r.get("url", ""),
+            "title": r.get("title", ""),
+            "score": round(sim, 4)
+        })
+        if RELEVANCE_MODE == "enforce":
+            if sim >= RELEVANCE_THRESHOLD:
+                surviving_results.append(r)
+            else:
+                dropped_sources.append((r.get("url", ""), f"similarity {sim:.3f} < threshold {RELEVANCE_THRESHOLD}"))
+        else:
+            surviving_results.append(r)
+
+    # Logging telemetry
+    print(f"  📊 [Relevance Scores (mode={RELEVANCE_MODE}, threshold={RELEVANCE_THRESHOLD})]:", flush=True)
+    for rec in score_records:
+        mark = "✓" if rec['score'] >= RELEVANCE_THRESHOLD else "✗"
+        print(f"     • [{mark}] {rec['score']:.4f} | {rec['url']}", flush=True)
+
+    if RELEVANCE_MODE == "enforce":
+        for d_url, d_reason in dropped_sources:
+            print(f"     • Dropped by relevance: {d_url} ({d_reason})", flush=True)
+        print(f"     • Count after relevance enforce: {len(surviving_results)} / {len(results)} survived", flush=True)
+
+    hidden_reason = ""
+    if RELEVANCE_MODE == "enforce" and not surviving_results:
+        hidden_reason = f"No sources met relevance threshold {RELEVANCE_THRESHOLD}"
+
+    return surviving_results, score_records, hidden_reason
 
 
 # ── Summarizer (unchanged across versions) ───────────────────────────────
@@ -572,9 +834,12 @@ async def agent_rag_and_counterpoint_v3(claim: str, search_query: str, page_url:
             tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         raw_results = response.get('results', [])
-        tavily_results = filter_and_dedupe_tavily_results(raw_results, page_url)
-    except:
-        pass
+        cleaned_results = filter_and_dedupe_tavily_results(raw_results, page_url=page_url, claim_text=claim)
+        surviving_results, relevance_scores, hidden_reason = await apply_relevance_filter(claim, cleaned_results)
+        tavily_results = surviving_results
+    except Exception as e:
+        print(f"  ⚠️ Error in Tavily retrieval / filtering for '{claim[:40]}...': {e}", flush=True)
+        hidden_reason = f"Search error: {e}"
 
     if tavily_results:
         source_blocks = []
@@ -609,13 +874,23 @@ Instructions:
 
 Return JSON: {{"stance": "contested|supported|insufficient", "counterpoint": "... [1] ...", "cited": [1, 2]}}"""
 
-    data = await _safe_llm_json(
+    data, model_used, latency = await _safe_llm_json_counterpoint(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2
     )
 
     if data is None:
-        return {"stance": "insufficient", "counterpoint": "Analysis failed.", "sources": [], "raw_agent_output": None, "tavily_count": len(tavily_results)}
+        return {
+            "stance": "insufficient",
+            "counterpoint": "Analysis failed.",
+            "sources": [],
+            "raw_agent_output": None,
+            "tavily_count": len(tavily_results),
+            "model_used": model_used,
+            "latency": latency,
+            "relevance_scores": relevance_scores if 'relevance_scores' in locals() else [],
+            "hidden_reason": hidden_reason if 'hidden_reason' in locals() and hidden_reason else "LLM analysis failed",
+        }
 
     cited_indices = data.get("cited", [])
     real_sources = []
@@ -631,6 +906,10 @@ Return JSON: {{"stance": "contested|supported|insufficient", "counterpoint": "..
         "sources": real_sources,
         "raw_agent_output": data,
         "tavily_count": len(tavily_results),
+        "model_used": model_used,
+        "latency": latency,
+        "relevance_scores": relevance_scores if 'relevance_scores' in locals() else [],
+        "relevance_hidden_reason": hidden_reason if 'hidden_reason' in locals() and hidden_reason else "",
     }
 
 
@@ -901,9 +1180,12 @@ async def agent_perspective_v6(claim: str, search_query: str, page_url: str = ""
             tavily_client.search, query=search_query, search_depth="advanced", max_results=5, exclude_domains=EXCLUDE_DOMAINS
         )
         raw_results = response.get('results', [])
-        tavily_results = filter_and_dedupe_tavily_results(raw_results, page_url)
-    except:
-        pass
+        cleaned_results = filter_and_dedupe_tavily_results(raw_results, page_url=page_url, claim_text=claim)
+        surviving_results, relevance_scores, hidden_reason = await apply_relevance_filter(claim, cleaned_results)
+        tavily_results = surviving_results
+    except Exception as e:
+        print(f"  ⚠️ Error in Tavily retrieval / filtering for '{claim[:40]}...': {e}", flush=True)
+        hidden_reason = f"Search error: {e}"
 
     if tavily_results:
         source_blocks = []
@@ -935,7 +1217,7 @@ Instructions:
 Return JSON:
 {{"consensus": "broad_agreement|split|minority_dissent", "who_argues": "named organization, author or study", "argument": "...", "cited": [1]}}"""
 
-    data = await _safe_llm_json(
+    data, model_used, latency = await _safe_llm_json_counterpoint(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.2
     )
@@ -949,9 +1231,12 @@ Return JSON:
             "counterpoint": "Analysis failed.",
             "sources": [],
             "show_card": False,
-            "hidden_reason": "LLM analysis failed",
+            "hidden_reason": hidden_reason if 'hidden_reason' in locals() and hidden_reason else "LLM analysis failed",
             "raw_agent_output": None,
             "tavily_count": len(tavily_results),
+            "model_used": model_used,
+            "latency": latency,
+            "relevance_scores": relevance_scores if 'relevance_scores' in locals() else [],
         }
 
     who_argues = str(data.get("who_argues", "")).strip()
@@ -970,8 +1255,12 @@ Return JSON:
     # Remove the who_argues gate. For contested claims, show a card when
     # "argument" is non-empty AND at least one valid index in "cited" maps to a real source.
     # Treat who_argues as optional (ignore it if empty).
-    show_card = bool(argument) and len(real_sources) >= 1
-    hidden_reason = "" if show_card else ("Argument is empty" if not argument else "No cited source mapped to a real URL")
+    if 'hidden_reason' in locals() and hidden_reason:
+        # Dropped by relevance filter or search
+        show_card = False
+    else:
+        show_card = bool(argument) and len(real_sources) >= 1
+        hidden_reason = "" if show_card else ("Argument is empty" if not argument else "No cited source mapped to a real URL")
 
     return {
         "claim_kind": "contested",
@@ -984,6 +1273,9 @@ Return JSON:
         "hidden_reason": hidden_reason,
         "raw_agent_output": data,
         "tavily_count": len(tavily_results),
+        "model_used": model_used,
+        "latency": latency,
+        "relevance_scores": relevance_scores if 'relevance_scores' in locals() else [],
     }
 
 
@@ -1014,8 +1306,9 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
 
     print(f"\n[Analysis Generator] Today: {today_date} | Published: {published_date} | Page URL: {page_url} | Version: {PROMPT_VERSION}", flush=True)
 
-    # Check cache with PROMPT_VERSION included
-    cached = await asyncio.to_thread(get_cached_analysis, text, PROMPT_VERSION)
+    # Check cache with composite cache key
+    cache_version_key = f"{PROMPT_VERSION}:{COUNTERPOINT_MODEL}:{RELEVANCE_MODE}:{RELEVANCE_THRESHOLD}"
+    cached = await asyncio.to_thread(get_cached_analysis, text, cache_version_key)
     if cached:
         yield json.dumps({"status": "complete", "data": cached}) + "\n"
         return
@@ -1100,7 +1393,11 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
         verifier_output = res.get("verifier_output", None)
 
         # Logging per claim (whether it was shown or hidden and the reason):
+        model_used = res.get("model_used", None)
+        latency = res.get("latency", None)
         print(f"\n[Claim {order_index + 1}/{total_claims}]: {claim_text}", flush=True)
+        if model_used is not None and latency is not None:
+            print(f"  • Model: {model_used} (latency: {latency:.2f}s)", flush=True)
         if PROMPT_VERSION == "v6":
             print(f"  • Claim kind: {claim_kind}", flush=True)
             print(f"  • Search query: {search_query}", flush=True)
@@ -1158,8 +1455,8 @@ async def analysis_generator(text: str, published_date: str = None, today_date: 
     # Final payload
     final_data = {"summary": summary, "claims": full_claims_data}
     
-    # Save to Cache with version
-    await asyncio.to_thread(save_analysis_to_cache, text, final_data, PROMPT_VERSION)
+    # Save to Cache with composite cache key
+    await asyncio.to_thread(save_analysis_to_cache, text, final_data, cache_version_key)
     
     yield json.dumps({"status": "complete", "data": final_data}) + "\n"
 
